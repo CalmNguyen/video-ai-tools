@@ -1,0 +1,62 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local secrets and application settings (may contain API keys)
+.env
+.env.*
+!.env.example
+*.settings.json
+*.history.json
+*.local.json
+*.secret.json
+*.secrets.json
+*credentials*.json
+*api-key*.json
+*api_key*.json
+*apikey*.json
+service-account*.json
+service_account*.json
+
+# Generated video-editor output
+short_outputs/
+full_video_outputs/
+_renderer_smoke/
+
+# Python packaging and PyInstaller output
+build/
+dist/
+*.egg-info/
+*.egg
+temp/
+outputs/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+~$*
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Windows/macOS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
