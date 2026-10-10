@@ -126,10 +126,11 @@ class GeminiJsonClient:
 
     def generate_json(
         self,
-        prompt: str,
+        prompt: str | list[Any],
         label: str,
         max_output_tokens: int = 32768,
     ) -> Any:
+        """prompt is either plain text or a contents list (e.g. [audio_part, text])."""
         last_error: Exception | None = None
         for attempt in range(1, len(RETRY_DELAYS) + 2):
             if self.cancel_event.is_set():
@@ -158,6 +159,11 @@ class GeminiJsonClient:
                 if self.cancel_event.wait(delay):
                     raise InterruptedError("Stopped by user.")
         raise RuntimeError(str(last_error) if last_error else "Gemini request failed.")
+
+    @staticmethod
+    def audio_part(path: Path, mime_type: str = "audio/mpeg") -> Any:
+        ensure_google_genai()
+        return types.Part.from_bytes(data=Path(path).read_bytes(), mime_type=mime_type)
 
     def summarize_script(self, script: str) -> str:
         prompt = f"""

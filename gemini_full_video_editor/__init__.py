@@ -3,6 +3,8 @@
 from .models import (
     Asset,
     Cue,
+    DemoInsert,
+    DemoMoment,
     EditPlan,
     EditSegment,
     MediaInfo,
@@ -13,6 +15,8 @@ from .models import (
 __all__ = [
     "Asset",
     "Cue",
+    "DemoInsert",
+    "DemoMoment",
     "EditPlan",
     "EditSegment",
     "MediaInfo",

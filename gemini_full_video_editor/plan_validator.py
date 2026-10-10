@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from .models import Asset, Cue, EditPlan, EditSegment, MediaInfo
+from .models import Asset, Cue, DemoInsert, EditPlan, EditSegment, MediaInfo
 
 
 ALLOWED_VISUAL_TYPES = {
@@ -18,6 +18,8 @@ ALLOWED_VISUAL_TYPES = {
 ALLOWED_ANIMATIONS = {"none", "fade", "pop"}
 ALLOWED_POSITIONS = {"top", "center", "bottom"}
 EPSILON = 0.02
+MIN_DEMO_INSERT_SECONDS = 0.5
+MAX_DEMO_INSERT_SECONDS = 120.0
 
 
 def load_plan(path: Path) -> EditPlan:
@@ -73,6 +75,23 @@ def _fallback_segment(start: float, end: float, previous: EditSegment | None) ->
     )
 
 
+def _safe_insert_points(target_cues: Sequence[Cue], target_duration: float) -> list[float]:
+    """Target times that do not fall inside any spoken cue."""
+    points = {0.0, target_duration}
+    for cue in target_cues:
+        points.update((cue.start, cue.end))
+    return sorted(
+        point
+        for point in points
+        if 0.0 <= point <= target_duration
+        and not any(cue.start + EPSILON < point < cue.end - EPSILON for cue in target_cues)
+    )
+
+
+def _cue_ids_between(target_cues: Sequence[Cue], start: float, end: float) -> list[int]:
+    return [cue.id for cue in target_cues if cue.end > start + EPSILON and cue.start < end - EPSILON]
+
+
 class PlanValidator:
     def __init__(self, logger: Callable[[str], None]):
         self.logger = logger
@@ -94,6 +113,7 @@ class PlanValidator:
         assets: Sequence[Asset],
         max_speed_up: float,
         max_slow_down: float,
+        allow_demo_inserts: bool = False,
     ) -> tuple[EditPlan, dict[str, Any]]:
         if not plan.segments:
             raise ValueError("Edit plan has no segments; refusing to render a blank plan.")
@@ -202,6 +222,15 @@ class PlanValidator:
         if not accepted:
             raise ValueError("No valid edit segments remain after validation.")
 
+        demo_inserts = self._validate_demo_inserts(
+            plan.demo_inserts,
+            source_info,
+            target_audio_duration,
+            target_cues,
+            allow_demo_inserts,
+        )
+        accepted = self._split_at_inserts(accepted, demo_inserts, target_cues)
+
         for index, segment in enumerate(accepted, start=1):
             segment.id = f"seg_{index:03d}"
             segment.target_start = round(segment.target_start, 3)
@@ -211,9 +240,162 @@ class PlanValidator:
             target_duration=round(target_audio_duration, 3),
             segments=accepted,
             project=plan.project,
+            demo_inserts=demo_inserts,
         )
         report = self._report(validated, target_cues)
         return validated, report
+
+    def _validate_demo_inserts(
+        self,
+        inserts: Sequence[DemoInsert],
+        source_info: MediaInfo,
+        target_duration: float,
+        target_cues: Sequence[Cue],
+        allowed: bool,
+    ) -> list[DemoInsert]:
+        if not inserts:
+            return []
+        if not allowed:
+            self._warn(
+                f"Removed {len(inserts)} demo insert(s): keeping original demo audio is disabled."
+            )
+            self.repairs += 1
+            return []
+        if not source_info.has_audio:
+            self._warn(f"Removed {len(inserts)} demo insert(s): the original video has no audio.")
+            self.repairs += 1
+            return []
+        safe_points = _safe_insert_points(target_cues, target_duration)
+        accepted: list[DemoInsert] = []
+        used_demo_ids: set[str] = set()
+        for raw in sorted(inserts, key=lambda item: item.insert_at):
+            item = DemoInsert.from_dict(raw.to_dict(), raw.id)
+            start = max(0.0, item.source_start)
+            end = min(source_info.duration, item.source_end)
+            if end - start < MIN_DEMO_INSERT_SECONDS:
+                self._warn(f"Removed {item.id}: source range is empty or too short.")
+                self.repairs += 1
+                continue
+            if end - start > MAX_DEMO_INSERT_SECONDS:
+                end = start + MAX_DEMO_INSERT_SECONDS
+                self._warn(f"{item.id}: demo trimmed to {MAX_DEMO_INSERT_SECONDS:.0f}s.")
+                self.repairs += 1
+            if item.demo_id and item.demo_id in used_demo_ids:
+                self._warn(f"Removed {item.id}: {item.demo_id} is already inserted.")
+                self.repairs += 1
+                continue
+            if any(start < other.source_end and end > other.source_start for other in accepted):
+                self._warn(f"Removed {item.id}: its source range overlaps another demo insert.")
+                self.repairs += 1
+                continue
+            wanted = max(0.0, min(target_duration, item.insert_at))
+            insert_at = (
+                min(safe_points, key=lambda point: abs(point - wanted)) if safe_points else wanted
+            )
+            if abs(insert_at - item.insert_at) > 0.05:
+                self._warn(
+                    f"{item.id}: insertAt {item.insert_at:.3f} snapped to the sentence "
+                    f"boundary {insert_at:.3f}."
+                )
+            item.insert_at = round(insert_at, 3)
+            item.source_start = round(start, 3)
+            item.source_end = round(end, 3)
+            item.volume = round(max(0.0, min(2.0, item.volume)), 3)
+            if item.demo_id:
+                used_demo_ids.add(item.demo_id)
+            accepted.append(item)
+        accepted.sort(key=lambda item: (item.insert_at, item.source_start))
+        for index, item in enumerate(accepted, start=1):
+            item.id = f"demo_insert_{index:03d}"
+        return accepted
+
+    def _split_at_inserts(
+        self,
+        segments: list[EditSegment],
+        inserts: Sequence[DemoInsert],
+        target_cues: Sequence[Cue],
+    ) -> list[EditSegment]:
+        """Make every insert point a segment boundary so the insert is a clean cut."""
+        result = list(segments)
+        for item in inserts:
+            for index, segment in enumerate(result):
+                if segment.target_start + EPSILON < item.insert_at < segment.target_end - EPSILON:
+                    first, second = self._split_segment(
+                        segment, item.insert_at - segment.target_start, target_cues
+                    )
+                    result[index : index + 1] = [first, second]
+                    break
+        return result
+
+    def _split_segment(
+        self, segment: EditSegment, offset: float, target_cues: Sequence[Cue]
+    ) -> tuple[EditSegment, EditSegment]:
+        first = EditSegment.from_dict(segment.to_dict(), segment.id)
+        second = EditSegment.from_dict(segment.to_dict(), segment.id + "b")
+        first.target_end = segment.target_start + offset
+        second.target_start = first.target_end
+        first.target_cue_ids = _cue_ids_between(target_cues, first.target_start, first.target_end)
+        second.target_cue_ids = _cue_ids_between(
+            target_cues, second.target_start, second.target_end
+        )
+
+        visual_type = segment.visual.get("type")
+        if visual_type in {"source_video", "asset_video"}:
+            start_key, end_key = (
+                ("sourceStart", "sourceEnd")
+                if visual_type == "source_video"
+                else ("assetStart", "assetEnd")
+            )
+            range_start = _number(segment.visual.get(start_key), 0.0)
+            range_end = _number(segment.visual.get(end_key), range_start)
+            speed = max(EPSILON, _number(segment.visual.get("playbackSpeed"), 1.0))
+            played = (range_end - range_start) / speed
+            if offset < played - EPSILON:
+                middle = round(range_start + offset * speed, 3)
+                first.visual[end_key] = middle
+                first.visual["holdLastFrameSeconds"] = 0.0
+                second.visual[start_key] = middle
+            else:
+                first.visual["holdLastFrameSeconds"] = round(offset - played, 3)
+                if visual_type == "source_video":
+                    second.visual = {
+                        "type": "source_freeze_frame",
+                        "sourceTime": round(max(0.0, range_end - 0.05), 3),
+                        "fitMode": self._fit_mode(segment.visual),
+                    }
+                else:
+                    tail_start = max(range_start, range_end - 0.1)
+                    second.visual[start_key] = round(tail_start, 3)
+                    second.visual["playbackSpeed"] = 1.0
+                    second.visual["holdLastFrameSeconds"] = round(
+                        max(0.0, second.duration - (range_end - tail_start)), 3
+                    )
+        for part in (first, second):
+            if isinstance(part.visual.get("zoom"), dict):
+                part.visual["zoom"] = {**part.visual["zoom"], "enabled": False}
+            if isinstance(part.visual.get("motion"), dict):
+                part.visual["motion"] = {**part.visual["motion"], "type": "none"}
+
+        overlay = segment.overlay
+        if overlay.get("type") == "text":
+            overlay_start = _number(overlay.get("startOffset"), 0.0)
+            overlay_end = overlay_start + _number(overlay.get("duration"), segment.duration)
+            first.overlay = {"type": "none"}
+            second.overlay = {"type": "none"}
+            if overlay_start < offset - EPSILON:
+                first.overlay = {
+                    **overlay,
+                    "duration": round(min(overlay_end, offset) - overlay_start, 3),
+                }
+            if overlay_end > offset + EPSILON:
+                new_start = max(overlay_start, offset) - offset
+                second.overlay = {
+                    **overlay,
+                    "startOffset": round(new_start, 3),
+                    "duration": round(overlay_end - offset - new_start, 3),
+                }
+        self.logger(f"Split {segment.id} at {first.target_end:.3f}s for a demo insert.")
+        return first, second
 
     def _validate_visual(
         self,
@@ -480,6 +662,9 @@ class PlanValidator:
             "fallbackPercent": round(100 * totals["fallback"] / duration, 1),
             "averageSourceSpeed": round(average_speed, 3),
             "maximumSourceSpeed": round(max((speed for speed, _ in speeds), default=0.0), 3),
+            "demoInsertCount": len(plan.demo_inserts),
+            "demoAudioSeconds": round(plan.demo_duration, 3),
+            "finalDuration": round(plan.final_duration, 3),
             "repairs": self.repairs,
             "speedClamps": self.speed_clamps,
             "warnings": self.warnings,
@@ -498,6 +683,9 @@ def format_validation_report(report: dict[str, Any]) -> str:
         f"Fallback: {report.get('fallbackPercent', 0)}%\n"
         f"Average source speed: {report.get('averageSourceSpeed', 0)}x\n"
         f"Maximum source speed: {report.get('maximumSourceSpeed', 0)}x\n"
+        f"Demo inserts (original audio): {report.get('demoInsertCount', 0)} "
+        f"({report.get('demoAudioSeconds', 0)}s)\n"
+        f"Final duration: {report.get('finalDuration', 0)}s\n"
         f"Repairs: {report.get('repairs', 0)}\n"
         f"Speed clamps: {report.get('speedClamps', 0)}"
     )

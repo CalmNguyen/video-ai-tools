@@ -4,8 +4,9 @@
 
 Khác với việc chỉ thay audio, công cụ sẽ:
 
-- Đọc nội dung và timestamp của video gốc qua SRT.
-- Đọc script gốc để hiểu toàn bộ ngữ cảnh.
+- Đọc nội dung và timestamp của video gốc qua SRT (có thể bấm `Gemini SRT` để tự tạo).
+- Đọc script gốc (nhập tay, không bắt buộc) để hiểu toàn bộ ngữ cảnh.
+- Nghe audio gốc để tìm các đoạn demo và giữ đúng âm thanh gốc ở những đoạn đó.
 - Đọc SRT của giọng mới để xác định timeline đầu ra.
 - Dùng Gemini ghép nội dung tương ứng giữa hai timeline theo ngữ nghĩa.
 - Tạo một `edit_plan.json` có thể xem và sửa thủ công.
@@ -49,10 +50,16 @@ Sau khi chỉnh `PATH`, đóng PowerShell hiện tại, mở cửa sổ PowerShe
 
 ## 4. Chạy ứng dụng
 
-Tại thư mục dự án, chạy:
+Cách nhanh nhất: chạy launcher chung rồi chọn `Full Video Editor`:
 
 ```powershell
 cd D:\work\python\VideoAI
+python main.py
+```
+
+Hoặc mở thẳng tool:
+
+```powershell
 python gemini_ai_full_video_editor.py
 ```
 
@@ -64,13 +71,24 @@ python -m gemini_full_video_editor
 
 ## 5. Chuẩn bị đầu vào
 
-Ứng dụng cần 5 file bắt buộc:
+Ứng dụng cần:
 
 1. `Original Video`: video MP4/MOV/MKV/WEBM gốc.
-2. `Original Video SRT`: phụ đề khớp chính xác với video gốc.
-3. `Original Script TXT`: bản script gốc đầy đủ, sạch và chưa chia subtitle.
-4. `Target Voice MP3`: giọng đọc mới dùng làm audio chính.
-5. `Target Voice SRT`: phụ đề khớp chính xác với giọng đọc mới.
+2. `Original Video SRT`: phụ đề khớp với video gốc. Không có sẵn thì bấm
+   `Gemini SRT` bên cạnh để Gemini nghe video và tạo SRT.
+3. `Target Voice MP3`: giọng đọc mới dùng làm audio chính.
+4. `Target Voice SRT`: phụ đề khớp với giọng đọc mới (cũng có nút `Gemini SRT`).
+5. `Original script` (không bắt buộc): gõ hoặc dán trực tiếp vào ô text. Nút
+   `Load TXT...` nạp nội dung từ file .txt vào ô. Để trống thì app dùng nội dung
+   của Original Video SRT làm ngữ cảnh.
+
+### Tạo SRT bằng Gemini
+
+- Nút `Gemini SRT` dùng model trong ô `SRT model` (mặc định bản Flash).
+- Audio được cắt thành từng đoạn 5 phút và gửi song song cho Gemini để timestamp chính xác hơn.
+- File SRT lưu tại `Output Folder/generated_srt/<tên file>.srt` và được điền sẵn vào ô SRT.
+- Sau khi tạo xong sẽ mở cửa sổ xem SRT: `Copy all` copy toàn bộ SRT vào clipboard,
+  `Save changes` lưu lại nếu bạn sửa tay. Nút `View / Copy` mở lại cửa sổ này cho bất kỳ SRT nào.
 
 Có thể chọn thêm `Assets Folder`. Thư mục này hỗ trợ:
 
@@ -89,7 +107,7 @@ Chọn model trong ô `Model`, hoặc nhập model ID khác. Bật `Remember API
 
 ### Bước 2: Chọn các file đầu vào
 
-Chọn đủ 5 file bắt buộc, thư mục assets nếu có, và thư mục output.
+Chọn video, giọng mới, tạo hoặc chọn 2 file SRT, nhập script nếu có, thư mục assets nếu có, và thư mục output.
 
 ### Bước 3: Cấu hình dựng video
 
@@ -102,6 +120,12 @@ Chọn đủ 5 file bắt buộc, thư mục assets nếu có, và thư mục ou
 - `Original audio / Mute`: tắt hoàn toàn tiếng gốc.
 - `Original audio / Background`: giữ tiếng gốc nhỏ dưới giọng mới.
 - `Background volume`: mặc định `0.10`.
+- `Keep original demo audio`: mặc định bật. Gemini nghe audio gốc để tìm đoạn demo
+  cần nghe tiếng thật (giọng AI mẫu, nhạc, tiếng app/game, video được phát lại,
+  người khác nói trong demo...). Ở những đoạn đó, giọng mới tạm dừng, video phát
+  đúng cảnh + âm thanh gốc ở tốc độ 1.0x, sau đó giọng mới đọc tiếp. Lời giảng của
+  người nói gốc không được tính là demo. Video cuối vì vậy dài hơn giọng mới đúng
+  bằng tổng thời lượng demo, và phụ đề được dời theo.
 - `Normalize final audio`: chuẩn hóa âm lượng cuối.
 - `Max Speed Up`: mặc định `1.20`.
 - `Max Slow Down`: mặc định `0.85`.
@@ -129,8 +153,10 @@ Analyze & Create Plan
 2. Đọc metadata video và audio bằng ffprobe.
 3. Quét assets.
 4. Gọi Gemini để semantic alignment.
-5. Gọi Gemini để tạo edit plan.
-6. Kiểm tra cue ID, timestamp, asset, gap, overlap và tốc độ.
+5. Gọi Gemini nghe audio gốc để tìm đoạn demo (nếu bật `Keep original demo audio`).
+6. Gọi Gemini để tạo edit plan, gồm cả vị trí chèn demo.
+7. Kiểm tra cue ID, timestamp, asset, gap, overlap, tốc độ và điểm chèn demo
+   (luôn được đặt ở ranh giới câu, không cắt ngang lời đọc).
 
 Sau khi hoàn tất, ứng dụng tự điền đường dẫn `edit_plan.json` vào ô `Edit Plan JSON`.
 
@@ -153,6 +179,20 @@ thành:
 ```json
 "sourceStart": 53.4
 ```
+
+Đoạn demo nằm trong mảng `demoInserts`:
+
+```json
+"demoInserts": [
+  {"demoId": "demo_001", "insertAt": 42.8, "sourceStart": 95.2, "sourceEnd": 103.6, "volume": 1.0}
+]
+```
+
+- `insertAt`: thời điểm trên timeline giọng mới mà giọng mới tạm dừng.
+- `sourceStart` / `sourceEnd`: đoạn video gốc (cả hình + tiếng) được phát.
+- `volume`: âm lượng tiếng gốc của đoạn demo (0 - 2).
+
+Có thể thêm/xóa demo bằng tay. Danh sách demo Gemini tìm được nằm ở `demo_moments.json`.
 
 Lưu lại file. Không cần gọi Gemini lại.
 
@@ -184,6 +224,7 @@ full_video_outputs/
         validated_edit_plan.json
         validation_report.json
         asset_manifest.json
+        demo_moments.json
         script_context.txt
         final_video.mp4
         final_video.srt
@@ -196,7 +237,8 @@ Các file quan trọng:
 - `semantic_alignment.json`: nội dung tương ứng giữa SRT gốc và SRT mới.
 - `edit_plan.json`: plan gốc từ Gemini, có thể sửa bằng tay.
 - `validated_edit_plan.json`: plan sau khi được kiểm tra và sửa lỗi an toàn.
-- `validation_report.json`: báo cáo coverage, speed và fallback.
+- `demo_moments.json`: các đoạn demo Gemini tìm thấy trong audio gốc.
+- `validation_report.json`: báo cáo coverage, speed, fallback và demo inserts.
 - `final_video.mp4`: video hoàn chỉnh.
 - `logs.txt`: log đầy đủ để kiểm tra khi có lỗi.
 
@@ -207,7 +249,7 @@ Nếu render thất bại, plan và thư mục `temp` vẫn được giữ lại
 Để render lại một plan cũ:
 
 1. Mở ứng dụng.
-2. Chọn lại đúng video, SRT, script, target voice và assets đã dùng để tạo plan.
+2. Chọn lại đúng video, SRT, target voice và assets đã dùng để tạo plan.
 3. Chọn file `edit_plan.json` trong ô `Edit Plan JSON`.
 4. Nhấn `Render Video`.
 
@@ -264,10 +306,11 @@ Plan không chứa file media bên trong. Khi render lại, cần chọn đúng 
 
 ### Video cuối ngắn hơn giọng đọc
 
-Mở `logs.txt` và kiểm tra bước `Final verification`. Target Voice MP3 luôn là timeline chính; ứng dụng sẽ không chủ động dùng visual ngắn để cắt mất giọng đọc.
+Mở `logs.txt` và kiểm tra bước `Final verification`. Target Voice MP3 luôn là timeline chính; ứng dụng sẽ không chủ động dùng visual ngắn để cắt mất giọng đọc. Khi có demo inserts, video cuối = thời lượng giọng mới + tổng thời lượng demo.
 
 ## 11. File chạy chính
 
-- Launcher: `gemini_ai_full_video_editor.py`
+- Launcher chung cho mọi tool: `main.py`
+- Launcher riêng: `gemini_ai_full_video_editor.py`
 - Package ứng dụng: `gemini_full_video_editor/`
 - Công cụ short cũ: `gemini_video_short_cutter.py` — không bị thay đổi.

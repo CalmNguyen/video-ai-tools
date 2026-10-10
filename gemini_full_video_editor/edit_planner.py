@@ -4,7 +4,16 @@ import json
 from typing import Any, Callable, Sequence
 
 from .gemini_client import GeminiJsonClient
-from .models import Asset, Cue, EditPlan, EditSegment, MediaInfo, SemanticAlignment
+from .models import (
+    Asset,
+    Cue,
+    DemoInsert,
+    DemoMoment,
+    EditPlan,
+    EditSegment,
+    MediaInfo,
+    SemanticAlignment,
+)
 from .semantic_aligner import _cue_chunks, source_ids_by_target
 
 
@@ -28,6 +37,28 @@ must stay within source duration. Asset ranges must stay within asset duration.
 Use moderate speed fitting only; prefer a freeze frame or another cut when source
 footage is too short. Text overlays are short keyword/menu/number emphasis, not
 complete subtitles. Do not output arbitrary x/y coordinates.
+""".strip()
+
+
+def _demo_instructions(demo_moments: Sequence[DemoMoment]) -> str:
+    if not demo_moments:
+        return ""
+    return f"""
+SOURCE DEMO MOMENTS: spans of the ORIGINAL audio the viewer must hear (generated
+voice, product sound, music, playback...). The new narration PAUSES while a demo
+insert plays its own source footage and original audio at 1.0x, then resumes.
+{json.dumps([moment.to_dict() for moment in demo_moments], ensure_ascii=False)}
+
+When the narration in THIS chunk introduces, describes, or reacts to one of these
+moments, add it to "demoInserts":
+{{"demoId":"demo_001","insertAt":12.34,"sourceStart":50.2,"sourceEnd":57.9,"reason":"..."}}
+- insertAt is an absolute target narration time exactly at the END of a target cue
+  (never mid-sentence), normally right after the line that introduces the demo
+  ("listen to this", "here is the result"...).
+- End a visual segment exactly at insertAt so the cut is clean.
+- sourceStart/sourceEnd stay inside the demo moment; trim only obvious dead air.
+- Do not also schedule the same demo footage inside "segments".
+- Use each demoId at most once. Omit demos that the narration does not refer to.
 """.strip()
 
 
@@ -76,10 +107,14 @@ class EditPlanner:
         assets: Sequence[Asset],
         extra_instructions: str,
         project: dict[str, Any],
+        demo_moments: Sequence[DemoMoment] = (),
     ) -> EditPlan:
         chunks = _cue_chunks(target_cues)
         mapping = source_ids_by_target(alignments)
+        demo_text = _demo_instructions(demo_moments)
+        demo_envelope = ',"demoInserts":[]' if demo_moments else ""
         all_segments: list[EditSegment] = []
+        all_inserts: list[DemoInsert] = []
         for index, target_chunk in enumerate(chunks, start=1):
             chunk_start = 0.0 if index == 1 else target_chunk[0].start
             chunk_end = (
@@ -104,7 +139,7 @@ Return JSON only in this exact envelope:
   "overlay":{{"type":"none"}},
   "transitionOut":{{"type":"cut","duration":0}},
   "reason":"..."
-}}]}}
+}}]{demo_envelope}}}
 
 For source_freeze_frame use sourceTime. For asset_image use assetId and optional
 motion {{"type":"slow_zoom","startScale":1.0,"endScale":1.05}}. For asset_video
@@ -132,6 +167,8 @@ TARGET CUES IN THIS CHUNK:
 AVAILABLE ASSETS (empty means use none):
 {json.dumps([asset.to_dict() for asset in assets], ensure_ascii=False)}
 
+{demo_text}
+
 USER INSTRUCTIONS:
 {extra_instructions.strip() or '(none)'}
 """.strip()
@@ -148,15 +185,30 @@ USER INSTRUCTIONS:
                     all_segments.append(
                         EditSegment.from_dict(raw, f"seg_{len(all_segments) + 1:03d}")
                     )
+            raw_inserts = payload.get("demoInserts") if isinstance(payload, dict) else None
+            for raw in raw_inserts if isinstance(raw_inserts, list) else []:
+                if isinstance(raw, dict):
+                    all_inserts.append(
+                        DemoInsert.from_dict(raw, f"demo_insert_{len(all_inserts) + 1:03d}")
+                    )
 
         if not all_segments:
             raise RuntimeError("Gemini returned an empty edit plan.")
         all_segments.sort(key=lambda segment: (segment.target_start, segment.target_end))
         for index, segment in enumerate(all_segments, start=1):
             segment.id = f"seg_{index:03d}"
+        all_inserts.sort(key=lambda item: item.insert_at)
+        for index, item in enumerate(all_inserts, start=1):
+            item.id = f"demo_insert_{index:03d}"
+        if demo_moments:
+            self.logger(
+                f"Planner placed {len(all_inserts)} demo insert(s) "
+                f"from {len(demo_moments)} detected demo moment(s)."
+            )
         return EditPlan(
             version=1,
             target_duration=target_duration,
             segments=all_segments,
             project=project,
+            demo_inserts=all_inserts,
         )

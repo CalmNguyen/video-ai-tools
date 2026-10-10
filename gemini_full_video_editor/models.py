@@ -85,6 +85,74 @@ class SemanticAlignment:
         }
 
 
+@dataclass(frozen=True)
+class DemoMoment:
+    """A span of the original audio that viewers must hear (detected by Gemini)."""
+
+    id: str
+    source_start: float
+    source_end: float
+    kind: str = "other"
+    description: str = ""
+    confidence: float = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "sourceStart": round(self.source_start, 3),
+            "sourceEnd": round(self.source_end, 3),
+            "kind": self.kind,
+            "description": self.description,
+            "confidence": round(self.confidence, 3),
+        }
+
+
+@dataclass
+class DemoInsert:
+    """Original footage + original audio played while the new narration pauses."""
+
+    id: str
+    insert_at: float
+    source_start: float
+    source_end: float
+    demo_id: str = ""
+    volume: float = 1.0
+    reason: str = ""
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.source_end - self.source_start)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], fallback_id: str) -> "DemoInsert":
+        def number(name: str, default: float = 0.0) -> float:
+            try:
+                return float(data.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            id=str(data.get("id", fallback_id)).strip() or fallback_id,
+            insert_at=number("insertAt"),
+            source_start=number("sourceStart"),
+            source_end=number("sourceEnd"),
+            demo_id=str(data.get("demoId", "")).strip(),
+            volume=number("volume", 1.0),
+            reason=str(data.get("reason", "")).strip(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "demoId": self.demo_id,
+            "insertAt": round(self.insert_at, 3),
+            "sourceStart": round(self.source_start, 3),
+            "sourceEnd": round(self.source_end, 3),
+            "volume": round(self.volume, 3),
+            "reason": self.reason,
+        }
+
+
 @dataclass
 class EditSegment:
     id: str
@@ -164,6 +232,15 @@ class EditPlan:
     target_duration: float
     segments: list[EditSegment]
     project: dict[str, Any] = field(default_factory=dict)
+    demo_inserts: list[DemoInsert] = field(default_factory=list)
+
+    @property
+    def demo_duration(self) -> float:
+        return sum(item.duration for item in self.demo_inserts)
+
+    @property
+    def final_duration(self) -> float:
+        return self.target_duration + self.demo_duration
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "EditPlan":
@@ -181,12 +258,21 @@ class EditPlan:
             for index, item in enumerate(raw_segments, start=1)
             if isinstance(item, dict)
         ]
+        raw_inserts = data.get("demoInserts")
+        demo_inserts = [
+            DemoInsert.from_dict(item, f"demo_insert_{index:03d}")
+            for index, item in enumerate(
+                raw_inserts if isinstance(raw_inserts, list) else [], start=1
+            )
+            if isinstance(item, dict)
+        ]
         project = data.get("project")
         return cls(
             version=int(data.get("version", 1)),
             target_duration=duration,
             segments=segments,
             project=dict(project) if isinstance(project, dict) else {},
+            demo_inserts=demo_inserts,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -194,6 +280,7 @@ class EditPlan:
             "version": self.version,
             "targetDuration": round(self.target_duration, 3),
             "segments": [segment.to_dict() for segment in self.segments],
+            "demoInserts": [item.to_dict() for item in self.demo_inserts],
         }
         if self.project:
             result["project"] = self.project
@@ -206,7 +293,7 @@ class RunConfig:
     model: str
     source_video: Path
     source_srt: Path
-    original_script: Path
+    original_script_text: str
     target_voice: Path
     target_srt: Path
     assets_folder: Path | None
@@ -222,6 +309,7 @@ class RunConfig:
     max_slow_down: float
     extra_instructions: str
     subtitle_font_size: int = 14
+    keep_demo_audio: bool = True
 
     @property
     def output_size(self) -> tuple[int, int]:
@@ -235,7 +323,6 @@ class RunConfig:
         return {
             "sourceVideo": str(self.source_video),
             "sourceSrt": str(self.source_srt),
-            "originalScript": str(self.original_script),
             "targetVoice": str(self.target_voice),
             "targetSrt": str(self.target_srt),
             "assetsFolder": str(self.assets_folder) if self.assets_folder else "",
@@ -246,6 +333,7 @@ class RunConfig:
             "subtitleFontSize": self.subtitle_font_size,
             "originalAudioMode": self.original_audio_mode,
             "originalAudioVolume": round(self.original_audio_volume, 3),
+            "keepDemoAudio": self.keep_demo_audio,
             "normalizeAudio": self.normalize_audio,
             "maxSpeedUp": round(self.max_speed_up, 3),
             "maxSlowDown": round(self.max_slow_down, 3),

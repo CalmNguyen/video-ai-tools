@@ -5,6 +5,16 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_MODELS = (
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+)
+FLASH_MODELS = tuple(model for model in DEFAULT_MODELS if "flash" in model)
+
+
 class SettingsStore:
     def __init__(self, path: Path):
         self.path = path

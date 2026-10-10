@@ -7,8 +7,9 @@ Install Python dependency:
 FFmpeg and ffprobe must also be available in PATH.
 
 Workflow:
-1. Read an exported MP4 and its SRT transcript.
-2. Ask Gemini to find the strongest self-contained short clips.
+1. Read one or many MP4 files. A missing SRT is created automatically by
+   Gemini (API key A / model A, e.g. a free key + flash-lite).
+2. Ask Gemini (API key B / model B, e.g. a paid key + a stronger model) to find the strongest self-contained short clips.
 3. Call Gemini once per selected clip to create title, description, and a
    thumbnail-generation prompt (small independent requests are more reliable).
 4. Use FFmpeg to cut each clip and convert it to 1080x1920 vertical video.
@@ -71,6 +72,10 @@ except ImportError:  # handled with a friendly message at runtime
     types = None
 
 
+from gemini_full_video_editor.gemini_audio import transcribe_media  # noqa: E402
+from gemini_full_video_editor.gemini_client import GeminiJsonClient  # noqa: E402
+from gemini_full_video_editor.srt_utils import write_srt as write_generated_srt  # noqa: E402
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = SCRIPT_DIR / "gemini_video_short_cutter.settings.json"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "short_outputs"
@@ -83,6 +88,10 @@ DEFAULT_MODELS = (
 )
 RETRY_DELAYS = (5, 15, 30)
 DEFAULT_API_CONCURRENCY = 3
+DEFAULT_VIDEO_PARALLEL = 2
+MAX_VIDEO_PARALLEL = 6
+DEFAULT_SRT_PARALLEL = 2
+DEFAULT_SRT_MODEL = "gemini-3.5-flash-lite"
 MAX_API_CONCURRENCY = 8
 ANALYSIS_CHUNK_SECONDS = 15 * 60
 ANALYSIS_CHUNK_MAX_CHARS = 50_000
@@ -122,8 +131,12 @@ class ShortPlan:
 class RunConfig:
     api_key: str
     model: str
-    video_path: Path
-    srt_path: Path
+    srt_api_key: str
+    srt_model: str
+    auto_srt: bool
+    video_paths: tuple[Path, ...]
+    video_parallel: int
+    srt_parallel: int
     output_dir: Path
     min_duration: int
     max_duration: int
@@ -252,6 +265,10 @@ def parse_srt(text: str) -> list[Cue]:
             cues.append(Cue(start=start, end=end, text=caption))
     cues.sort(key=lambda cue: (cue.start, cue.end))
     return cues
+
+
+def video_srt_path(video: Path) -> Path:
+    return video.with_suffix(".srt")
 
 
 def probe_duration(path: str | Path) -> float:
@@ -458,30 +475,41 @@ TRANSCRIPT:
 """.strip()
         return self._generate_json(prompt, f"phân tích {chunk_index}/{chunk_count}")
 
-    def create_metadata(self, plan: ShortPlan, cues: Sequence[Cue], index: int) -> dict[str, str]:
+    def create_metadata(
+        self, plan: ShortPlan, cues: Sequence[Cue], index: int, video_name: str = ""
+    ) -> dict[str, str]:
         transcript = transcript_for_cues(cues)
         prompt = f"""
-Bạn là chuyên gia nội dung video short. Dựa CHỈ trên đoạn transcript bên dưới,
-hãy viết metadata hoàn chỉnh bằng ĐÚNG NGÔN NGỮ CHÍNH CỦA TRANSCRIPT.
+Bạn là chuyên gia nội dung video short và là art director chuyên thiết kế thumbnail
+có tỷ lệ nhấp cao. Dựa CHỈ trên đoạn transcript bên dưới, hãy viết metadata hoàn chỉnh.
 
-QUY TẮC NGÔN NGỮ BẮT BUỘC:
-- Trước tiên tự xác định ngôn ngữ mà người nói sử dụng chủ yếu trong transcript.
-- Transcript tiếng Việt: title, description, hashtag và thumbnail_prompt bằng tiếng Việt.
-- Transcript tiếng Anh: title, description, hashtag và thumbnail_prompt bằng tiếng Anh.
-- Với ngôn ngữ khác, dùng chính ngôn ngữ đó cho toàn bộ metadata.
-- Nếu transcript pha trộn nhiều ngôn ngữ, dùng ngôn ngữ xuất hiện nhiều nhất.
-- Không dịch metadata sang một ngôn ngữ khác với ngôn ngữ chính của transcript.
+QUY TẮC NGÔN NGỮ (áp dụng cho title và description):
+- Tự xác định ngôn ngữ người nói dùng chủ yếu trong transcript và viết title,
+  description, hashtag bằng đúng ngôn ngữ đó; không dịch sang ngôn ngữ khác.
 - Giữ nguyên tên riêng, tên sản phẩm và thuật ngữ chuyên môn khi cần thiết.
 
 - title: hấp dẫn, cụ thể, tự nhiên, tối đa 100 ký tự; không clickbait sai sự thật.
 - description: 2-4 câu dễ đăng lên YouTube Shorts/TikTok, sau đó 3-6 hashtag phù hợp.
-- thumbnail_prompt: prompt chi tiết để một model tạo ảnh thumbnail dọc 9:16; mô tả
-  chủ thể, hành động, bối cảnh, bố cục, ánh sáng, màu sắc và cảm xúc. Hình phải rõ
-  khi xem nhỏ. Không yêu cầu model ảnh tự viết chữ trong hình.
+- thumbnail_prompt: viết bằng TIẾNG ANH (model tạo ảnh hiểu tiếng Anh tốt nhất),
+  một đoạn văn liền mạch 80-140 từ, dùng cho ảnh dọc 9:16 (1080x1920). Bắt buộc có đủ:
+  1) Chủ thể chính MỘT điểm nhấn duy nhất, mô tả cụ thể (người/vật/cảnh liên quan
+     trực tiếp tới khoảnh khắc hay nhất của đoạn này, không chung chung);
+  2) Biểu cảm/cảm xúc mạnh và hành động (curiosity, shock, joy, tension...);
+  3) Khung hình: cận cảnh/trung cảnh, góc máy, chủ thể chiếm khoảng 60% khung hình
+     và đặt ở khoảng giữa; chừa vùng trống ở 15% trên cùng và 20% dưới cùng
+     (vùng giao diện app che) để thêm chữ sau;
+  4) Bối cảnh đơn giản, phông nền tách biệt khỏi chủ thể (shallow depth of field);
+  5) Ánh sáng (rim light/soft key light), bảng màu tương phản cao, 2-3 màu chủ đạo, bão hòa;
+  6) Phong cách (photorealistic hoặc cinematic hoặc 3D render... phù hợp nội dung);
+  7) Hình phải đọc rõ khi thu nhỏ bằng ngón tay cái. Đặt câu "no text, no watermark,
+     no logo, no captions" ở cuối để chữ được thêm bằng công cụ khác.
+  Không nhắc tên người thật hay thương hiệu có bản quyền trong prompt.
 - Không thêm markdown. Chỉ trả JSON hợp lệ đúng dạng:
 {{"title":"...","description":"...","thumbnail_prompt":"..."}}
 
+Video gốc: {video_name}
 Chủ đề dự kiến: {plan.topic}
+Lý do chọn đoạn này: {plan.reason or "(không có)"}
 Thời lượng: {plan.duration:.1f} giây
 
 TRANSCRIPT CỦA SHORT {index}:
@@ -762,8 +790,12 @@ class ShortCutterApp:
         self.api_key_var = tk.StringVar(value=os.getenv("GEMINI_API_KEY", "").strip())
         self.remember_key_var = tk.BooleanVar(value=False)
         self.model_var = tk.StringVar(value=DEFAULT_MODELS[0])
-        self.video_var = tk.StringVar()
-        self.srt_var = tk.StringVar()
+        self.srt_api_key_var = tk.StringVar(value=os.getenv("GEMINI_API_KEY", "").strip())
+        self.srt_model_var = tk.StringVar(value=DEFAULT_SRT_MODEL)
+        self.auto_srt_var = tk.BooleanVar(value=True)
+        self.video_parallel_var = tk.StringVar(value=str(DEFAULT_VIDEO_PARALLEL))
+        self.srt_parallel_var = tk.StringVar(value=str(DEFAULT_SRT_PARALLEL))
+        self.video_paths: list[str] = []
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.min_duration_var = tk.StringVar(value="25")
         self.max_duration_var = tk.StringVar(value="60")
@@ -782,51 +814,87 @@ class ShortCutterApp:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(6, weight=1)
+        main.rowconfigure(7, weight=1)
 
-        api = ttk.LabelFrame(main, text="Gemini", padding=8)
-        api.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
-        api.columnconfigure(1, weight=1)
-        ttk.Label(api, text="API Key").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(api, textvariable=self.api_key_var, show="*").grid(
+        srt_box = ttk.LabelFrame(
+            main, text="Gemini A - tự lấy SRT từ video (nên dùng key free + flash-lite)", padding=8
+        )
+        srt_box.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        srt_box.columnconfigure(1, weight=1)
+        ttk.Label(srt_box, text="API Key A").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(srt_box, textvariable=self.srt_api_key_var, show="*").grid(
             row=0, column=1, sticky="ew"
         )
-        ttk.Checkbutton(api, text="Lưu key trên máy", variable=self.remember_key_var).grid(
+        ttk.Checkbutton(srt_box, text="Lưu key trên máy", variable=self.remember_key_var).grid(
             row=0, column=2, padx=(8, 0)
         )
-        ttk.Label(api, text="Model").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(7, 0))
+        ttk.Label(srt_box, text="Model A").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(7, 0))
         ttk.Combobox(
-            api,
-            textvariable=self.model_var,
-            values=DEFAULT_MODELS,
-            state="normal",
+            srt_box, textvariable=self.srt_model_var, values=DEFAULT_MODELS, state="normal"
+        ).grid(row=1, column=1, sticky="ew", pady=(7, 0))
+        ttk.Checkbutton(
+            srt_box, text="Tự lấy SRT khi video chưa có file .srt cùng tên", variable=self.auto_srt_var
+        ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(7, 0))
+
+        api = ttk.LabelFrame(
+            main,
+            text="Gemini B - lên plan + title/description/thumbnail (nên dùng key paid + model mạnh)",
+            padding=8,
+        )
+        api.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        api.columnconfigure(1, weight=1)
+        ttk.Label(api, text="API Key B").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(api, textvariable=self.api_key_var, show="*").grid(row=0, column=1, sticky="ew")
+        ttk.Label(api, text="Model B").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(7, 0))
+        ttk.Combobox(
+            api, textvariable=self.model_var, values=DEFAULT_MODELS, state="normal"
         ).grid(row=1, column=1, sticky="ew", pady=(7, 0))
         ttk.Label(api, text="Có thể chọn hoặc nhập model ID khác").grid(
             row=1, column=2, sticky="w", padx=(8, 0), pady=(7, 0)
         )
-        ttk.Label(api, text="Request API song song").grid(
+        ttk.Label(api, text="Request API B song song").grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=(7, 0)
         )
         ttk.Spinbox(
-            api,
-            from_=1,
-            to=MAX_API_CONCURRENCY,
-            width=7,
-            textvariable=self.api_concurrency_var,
+            api, from_=1, to=MAX_API_CONCURRENCY, width=7, textvariable=self.api_concurrency_var
         ).grid(row=2, column=1, sticky="w", pady=(7, 0))
         ttk.Label(api, text="Khuyên dùng 2-4 để tránh rate limit").grid(
             row=2, column=2, sticky="w", padx=(8, 0), pady=(7, 0)
         )
 
-        files = ttk.LabelFrame(main, text="Đầu vào / đầu ra", padding=8)
-        files.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
-        files.columnconfigure(1, weight=1)
-        self._file_row(files, 0, "Video MP4", self.video_var, self._choose_video)
-        self._file_row(files, 1, "File SRT", self.srt_var, self._choose_srt)
-        self._file_row(files, 2, "Thư mục output", self.output_dir_var, self._choose_output)
+        files = ttk.LabelFrame(main, text="Video đầu vào (chọn nhiều file) / đầu ra", padding=8)
+        files.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        files.columnconfigure(0, weight=1)
+        list_frame = ttk.Frame(files)
+        list_frame.grid(row=0, column=0, sticky="ew")
+        list_frame.columnconfigure(0, weight=1)
+        self.video_list = tk.Listbox(list_frame, height=5, selectmode="extended")
+        self.video_list.grid(row=0, column=0, sticky="ew")
+        list_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.video_list.yview)
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        self.video_list.configure(yscrollcommand=list_scroll.set)
+        buttons = ttk.Frame(files)
+        buttons.grid(row=0, column=1, sticky="n", padx=(8, 0))
+        ttk.Button(buttons, text="Thêm video...", command=self._choose_videos).pack(fill="x")
+        ttk.Button(buttons, text="Xóa đã chọn", command=self._remove_videos).pack(fill="x", pady=(4, 0))
+        ttk.Button(buttons, text="Xóa hết", command=self._clear_videos).pack(fill="x", pady=(4, 0))
+        out_row = ttk.Frame(files)
+        out_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        out_row.columnconfigure(1, weight=1)
+        self._file_row(out_row, 0, "Thư mục output", self.output_dir_var, self._choose_output)
+        parallel = ttk.Frame(files)
+        parallel.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(parallel, text="Số video chạy song song").pack(side="left")
+        ttk.Spinbox(
+            parallel, from_=1, to=MAX_VIDEO_PARALLEL, width=5, textvariable=self.video_parallel_var
+        ).pack(side="left", padx=(6, 18))
+        ttk.Label(parallel, text="Video lấy SRT cùng lúc (key free nên để 1-2)").pack(side="left")
+        ttk.Spinbox(
+            parallel, from_=1, to=MAX_VIDEO_PARALLEL, width=5, textvariable=self.srt_parallel_var
+        ).pack(side="left", padx=(6, 0))
 
         options = ttk.LabelFrame(main, text="Cấu hình short", padding=8)
-        options.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        options.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         ttk.Label(options, text="Thời lượng min (giây)").grid(row=0, column=0, sticky="w")
         ttk.Spinbox(options, from_=10, to=180, width=7, textvariable=self.min_duration_var).grid(
             row=0, column=1, sticky="w", padx=(6, 18)
@@ -852,13 +920,13 @@ class ShortCutterApp:
         ).grid(row=1, column=4, columnspan=2, sticky="w", pady=(8, 0))
 
         instructions = ttk.LabelFrame(main, text="Yêu cầu thêm cho Gemini (không bắt buộc)", padding=6)
-        instructions.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        instructions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         instructions.columnconfigure(0, weight=1)
         self.instructions_text = scrolledtext.ScrolledText(instructions, height=4, wrap="word")
         self.instructions_text.grid(row=0, column=0, sticky="ew")
 
         actions = ttk.Frame(main)
-        actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         self.start_button = ttk.Button(actions, text="Tạo Shorts", command=self._start)
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(
@@ -871,7 +939,7 @@ class ShortCutterApp:
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
         output_line = ttk.Frame(main)
-        output_line.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        output_line.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         output_line.columnconfigure(1, weight=1)
         ttk.Label(output_line, text="Kết quả gần nhất").grid(row=0, column=0, padx=(0, 8))
         ttk.Entry(output_line, textvariable=self.last_output_var, state="readonly").grid(
@@ -879,7 +947,7 @@ class ShortCutterApp:
         )
 
         logs = ttk.LabelFrame(main, text="Log realtime", padding=6)
-        logs.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        logs.grid(row=7, column=0, columnspan=3, sticky="nsew")
         logs.rowconfigure(0, weight=1)
         logs.columnconfigure(0, weight=1)
         self.log_text = scrolledtext.ScrolledText(logs, wrap="word", state="disabled")
@@ -891,19 +959,25 @@ class ShortCutterApp:
         ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=3)
         ttk.Button(parent, text="Chọn...", command=command).grid(row=row, column=2, padx=(8, 0), pady=3)
 
-    def _choose_video(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Chọn video", filetypes=(("Video MP4", "*.mp4"), ("Video", "*.mp4 *.mov *.mkv *.webm"), ("Tất cả", "*.*"))
+    def _choose_videos(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title="Chọn một hoặc nhiều video",
+            filetypes=(("Video", "*.mp4 *.mov *.mkv *.webm *.avi *.m4v"), ("Tất cả", "*.*")),
         )
-        if path:
-            self.video_var.set(path)
+        for raw in paths:
+            normalized = str(Path(raw))
+            if normalized not in self.video_paths:
+                self.video_paths.append(normalized)
+                self.video_list.insert("end", normalized)
 
-    def _choose_srt(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Chọn subtitle", filetypes=(("SubRip", "*.srt"), ("Tất cả", "*.*"))
-        )
-        if path:
-            self.srt_var.set(path)
+    def _remove_videos(self) -> None:
+        for index in reversed(self.video_list.curselection()):
+            self.video_list.delete(index)
+            del self.video_paths[index]
+
+    def _clear_videos(self) -> None:
+        self.video_list.delete(0, "end")
+        self.video_paths.clear()
 
     def _choose_output(self) -> None:
         path = filedialog.askdirectory(title="Chọn thư mục output")
@@ -926,8 +1000,14 @@ class ShortCutterApp:
         try:
             data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             self.model_var.set(str(data.get("model", self.model_var.get())))
-            self.video_var.set(str(data.get("video_path", "")))
-            self.srt_var.set(str(data.get("srt_path", "")))
+            self.srt_model_var.set(str(data.get("srt_model", DEFAULT_SRT_MODEL)))
+            self.auto_srt_var.set(bool(data.get("auto_srt", True)))
+            self.video_parallel_var.set(str(data.get("video_parallel", DEFAULT_VIDEO_PARALLEL)))
+            self.srt_parallel_var.set(str(data.get("srt_parallel", DEFAULT_SRT_PARALLEL)))
+            for raw in data.get("video_paths", []):
+                if Path(str(raw)).is_file() and str(raw) not in self.video_paths:
+                    self.video_paths.append(str(raw))
+                    self.video_list.insert("end", str(raw))
             self.output_dir_var.set(str(data.get("output_dir", DEFAULT_OUTPUT_DIR)))
             self.min_duration_var.set(str(data.get("min_duration", 25)))
             self.max_duration_var.set(str(data.get("max_duration", 60)))
@@ -941,6 +1021,9 @@ class ShortCutterApp:
             self.remember_key_var.set(bool(data.get("remember_api_key", False)))
             if self.remember_key_var.get():
                 self.api_key_var.set(str(data.get("api_key", self.api_key_var.get())))
+                self.srt_api_key_var.set(
+                    str(data.get("srt_api_key", self.srt_api_key_var.get()))
+                )
             self.instructions_text.insert("1.0", str(data.get("extra_instructions", "")))
         except Exception as exc:
             self._append_log(f"Không đọc được settings: {exc}")
@@ -949,8 +1032,11 @@ class ShortCutterApp:
         remember = self.remember_key_var.get()
         data = {
             "model": self.model_var.get().strip(),
-            "video_path": self.video_var.get().strip(),
-            "srt_path": self.srt_var.get().strip(),
+            "srt_model": self.srt_model_var.get().strip(),
+            "auto_srt": self.auto_srt_var.get(),
+            "video_parallel": self.video_parallel_var.get().strip(),
+            "srt_parallel": self.srt_parallel_var.get().strip(),
+            "video_paths": list(self.video_paths),
             "output_dir": self.output_dir_var.get().strip(),
             "min_duration": self.min_duration_var.get().strip(),
             "max_duration": self.max_duration_var.get().strip(),
@@ -961,23 +1047,32 @@ class ShortCutterApp:
             "extra_instructions": self.instructions_text.get("1.0", "end").strip(),
             "remember_api_key": remember,
             "api_key": self.api_key_var.get().strip() if remember else "",
+            "srt_api_key": self.srt_api_key_var.get().strip() if remember else "",
         }
         SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _collect_config(self) -> RunConfig:
         api_key = self.api_key_var.get().strip()
         model = self.model_var.get().strip()
-        video_path = Path(self.video_var.get().strip())
-        srt_path = Path(self.srt_var.get().strip())
+        srt_api_key = self.srt_api_key_var.get().strip()
+        srt_model = self.srt_model_var.get().strip()
+        auto_srt = self.auto_srt_var.get()
         output_text = self.output_dir_var.get().strip()
         if not api_key:
-            raise ValueError("Bạn chưa nhập Gemini API Key.")
+            raise ValueError("Bạn chưa nhập Gemini API Key B (lên plan).")
         if not model:
-            raise ValueError("Bạn chưa chọn/nhập Gemini model.")
-        if not video_path.is_file():
-            raise ValueError("File video không tồn tại.")
-        if not srt_path.is_file():
-            raise ValueError("File SRT không tồn tại.")
+            raise ValueError("Bạn chưa chọn/nhập model B (lên plan).")
+        if not self.video_paths:
+            raise ValueError("Chưa chọn video nào.")
+        videos = tuple(Path(raw) for raw in self.video_paths)
+        for video in videos:
+            if not video.is_file():
+                raise ValueError(f"File video không tồn tại: {video}")
+        missing = [v.name for v in videos if not video_srt_path(v).is_file()]
+        if missing and not auto_srt:
+            raise ValueError("Thiếu file .srt cùng tên (hoặc bật tự lấy SRT) cho: " + ", ".join(missing))
+        if missing and not (srt_api_key and srt_model):
+            raise ValueError("Cần API Key A và model A để tự lấy SRT cho: " + ", ".join(missing))
         if not output_text:
             raise ValueError("Bạn chưa chọn thư mục output.")
         min_duration = parse_number(self.min_duration_var.get(), "Thời lượng min", 10, 180)
@@ -987,17 +1082,22 @@ class ShortCutterApp:
         return RunConfig(
             api_key=api_key,
             model=model,
-            video_path=video_path.resolve(),
-            srt_path=srt_path.resolve(),
+            srt_api_key=srt_api_key,
+            srt_model=srt_model,
+            auto_srt=auto_srt,
+            video_paths=tuple(v.resolve() for v in videos),
+            video_parallel=parse_number(
+                self.video_parallel_var.get(), "Số video song song", 1, MAX_VIDEO_PARALLEL
+            ),
+            srt_parallel=parse_number(
+                self.srt_parallel_var.get(), "Video lấy SRT cùng lúc", 1, MAX_VIDEO_PARALLEL
+            ),
             output_dir=Path(output_text).resolve(),
             min_duration=min_duration,
             max_duration=max_duration,
             max_shorts=parse_number(self.max_shorts_var.get(), "Số short", 1, 50),
             api_concurrency=parse_number(
-                self.api_concurrency_var.get(),
-                "Request API song song",
-                1,
-                MAX_API_CONCURRENCY,
+                self.api_concurrency_var.get(), "Request API song song", 1, MAX_API_CONCURRENCY
             ),
             vertical_mode=self.vertical_mode_var.get(),
             burn_subtitles=self.burn_subtitles_var.get(),
@@ -1033,151 +1133,194 @@ class ShortCutterApp:
             raise InterruptedError("Đã dừng theo yêu cầu.")
 
     def _run(self, config: RunConfig) -> None:
-        run_dir: Path | None = None
+        """Process every video; up to config.video_parallel videos run at the same time."""
+        srt_slots = threading.Semaphore(config.srt_parallel)
+        results: list[tuple[Path, str, str]] = []  # (video, run_dir, error)
+
+        def job(video: Path) -> tuple[Path, str, str]:
+            def log(message: str, name: str = video.name) -> None:
+                self._log(f"[{name}] {message}")
+
+            try:
+                run_dir = self._process_video(config, video, log, srt_slots)
+                return video, str(run_dir), ""
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                log(traceback.format_exc())
+                return video, "", str(exc)
+
         try:
-            self._log(f"Model: {config.model}")
-            self._log("Đang đọc SRT và kiểm tra video...")
-            srt_text, encoding, repaired = read_srt_text(config.srt_path)
-            cues = parse_srt(srt_text)
-            if not cues:
-                raise RuntimeError("SRT không có cue hợp lệ.")
-            video_duration = probe_duration(config.video_path)
-            if cues[0].start >= video_duration:
-                raise RuntimeError("Timestamp SRT nằm ngoài thời lượng video.")
-            cues = [cue for cue in cues if cue.start < video_duration]
-            self._log(
-                f"Đọc {len(cues)} subtitle ({encoding}); video dài {format_timestamp(video_duration)}."
-            )
-            if repaired:
-                self._log("Đã tự sửa lỗi encoding/mojibake trong nội dung SRT.")
-
-            client = GeminiShortClient(
-                config.api_key, config.model, self._log, self.cancel_event
-            )
-            chunks = chunk_cues(cues)
-            candidate_limit = min(config.max_shorts, max(2, math.ceil(config.max_shorts / len(chunks)) + 2))
-            analysis_jobs: list[Callable[[], Any]] = []
-            for chunk_index, chunk in enumerate(chunks, start=1):
-                self._check_cancelled()
-                self._log(
-                    f"Xếp hàng phân tích phần {chunk_index}/{len(chunks)} "
-                    f"({format_timestamp(chunk[0].start)} - {format_timestamp(chunk[-1].end)})..."
-                )
-                analysis_jobs.append(
-                    lambda chunk=chunk, chunk_index=chunk_index: client.find_candidates(
-                        chunk,
-                        config.min_duration,
-                        config.max_duration,
-                        candidate_limit,
-                        config.extra_instructions,
-                        chunk_index,
-                        len(chunks),
-                    )
-                )
-
-            analysis_workers = min(config.api_concurrency, len(analysis_jobs))
-            self._log(
-                f"Bắt đầu phân tích {len(analysis_jobs)} phần với "
-                f"{analysis_workers} request API song song."
-            )
-            analysis_payloads = run_parallel_api_jobs(
-                analysis_jobs, config.api_concurrency, self.cancel_event
-            )
-            candidates: list[ShortPlan] = []
-            for chunk_index, (chunk, payload) in enumerate(
-                zip(chunks, analysis_payloads), start=1
-            ):
-                normalized = normalize_candidates(
-                    payload, chunk, config.min_duration, config.max_duration, video_duration
-                )
-                candidates.extend(normalized)
-                self._log(f"Phần {chunk_index}: nhận {len(normalized)} ứng viên hợp lệ.")
-            plans = select_best_candidates(candidates, config.max_shorts)
-            if not plans:
-                raise RuntimeError(
-                    "Gemini không chọn được đoạn nào hợp lệ. Hãy giảm thời lượng min hoặc đổi yêu cầu thêm."
-                )
-            self._log(f"Đã chọn {len(plans)} short sau khi loại đoạn trùng.")
-
-            run_dir = build_run_directory(config.output_dir)
-            self._log(f"Thư mục phiên chạy: {run_dir}")
-            metadata_jobs: list[Callable[[], Any]] = []
-            for index, plan in enumerate(plans, start=1):
-                self._check_cancelled()
-                segment_cues = cues_for_range(cues, plan.start, plan.end)
-                self._log(
-                    f"Short {index}/{len(plans)}: xếp hàng request metadata "
-                    f"({format_timestamp(plan.start)} - {format_timestamp(plan.end)})."
-                )
-                metadata_jobs.append(
-                    lambda plan=plan, segment_cues=segment_cues, index=index: client.create_metadata(
-                        plan, segment_cues, index
-                    )
-                )
-
-            metadata_workers = min(config.api_concurrency, len(metadata_jobs))
-            self._log(
-                f"Bắt đầu tạo metadata cho {len(metadata_jobs)} short với "
-                f"{metadata_workers} request API song song."
-            )
-            metadata_results = run_parallel_api_jobs(
-                metadata_jobs, config.api_concurrency, self.cancel_event
-            )
-
-            for index, (plan, metadata) in enumerate(
-                zip(plans, metadata_results), start=1
-            ):
-                self._check_cancelled()
-                plan.title = metadata["title"]
-                plan.description = metadata["description"]
-                plan.thumbnail_prompt = metadata["thumbnail_prompt"]
-
-                slug = safe_filename(plan.title, f"short_{index:02d}")
-                prefix = f"short_{index:02d}_{slug}"
-                srt_path = run_dir / f"{prefix}.srt"
-                metadata_path = run_dir / f"{prefix}_metadata.txt"
-                video_path = run_dir / f"{prefix}.mp4"
-                write_clipped_srt(cues, plan.start, plan.end, srt_path)
-                write_metadata(metadata_path, plan, index)
-                plan.subtitle_path = str(srt_path)
-                plan.metadata_path = str(metadata_path)
-                self._log(f"Short {index}: đang cắt và chuyển sang video dọc 1080x1920...")
-                run_ffmpeg(
-                    config.video_path,
-                    video_path,
-                    plan.start,
-                    plan.duration,
-                    config.vertical_mode,
-                    srt_path if config.burn_subtitles else None,
-                    self._log,
-                    self.cancel_event,
-                )
-                plan.video_path = str(video_path)
-                self._log(f"Short {index} hoàn tất: {video_path.name}")
-                self._write_plan_json(run_dir, config, plans, video_duration, repaired)
-
-            self._write_plan_json(run_dir, config, plans, video_duration, repaired)
-            self.events.put(("complete", str(run_dir)))
+            count = len(config.video_paths)
+            workers = max(1, min(config.video_parallel, count))
+            self._log(f"Bắt đầu {count} video, chạy song song {workers} video.")
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="video") as pool:
+                futures = [pool.submit(job, video) for video in config.video_paths]
+                try:
+                    for future in as_completed(futures):
+                        result = future.result()
+                        results.append(result)
+                        status = "lỗi: " + result[2] if result[2] else "xong"
+                        self._log(f"[{result[0].name}] {status} ({len(results)}/{count})")
+                except BaseException:
+                    self.cancel_event.set()
+                    for future in futures:
+                        future.cancel()
+                    raise
+            self.events.put(("complete", (config.output_dir, results)))
         except InterruptedError as exc:
             self.events.put(("cancelled", str(exc)))
         except Exception as exc:
             self._log(traceback.format_exc())
-            self.events.put(("error", (str(exc), str(run_dir) if run_dir else "")))
+            self.events.put(("error", (str(exc), "")))
+
+    def _process_video(
+        self,
+        config: RunConfig,
+        video_path: Path,
+        log: Callable[[str], None],
+        srt_slots: threading.Semaphore,
+    ) -> Path:
+        self._check_cancelled()
+        srt_path = video_srt_path(video_path)
+        if not srt_path.is_file():
+            with srt_slots:
+                self._check_cancelled()
+                self._create_srt(config, video_path, srt_path, log)
+        log(f"Model plan: {config.model}")
+        log("Đang đọc SRT và kiểm tra video...")
+        srt_text, encoding, repaired = read_srt_text(srt_path)
+        cues = parse_srt(srt_text)
+        if not cues:
+            raise RuntimeError("SRT không có cue hợp lệ.")
+        video_duration = probe_duration(video_path)
+        if cues[0].start >= video_duration:
+            raise RuntimeError("Timestamp SRT nằm ngoài thời lượng video.")
+        cues = [cue for cue in cues if cue.start < video_duration]
+        log(f"Đọc {len(cues)} subtitle ({encoding}); video dài {format_timestamp(video_duration)}.")
+        if repaired:
+            log("Đã tự sửa lỗi encoding/mojibake trong nội dung SRT.")
+
+        client = GeminiShortClient(config.api_key, config.model, log, self.cancel_event)
+        chunks = chunk_cues(cues)
+        candidate_limit = min(
+            config.max_shorts, max(2, math.ceil(config.max_shorts / len(chunks)) + 2)
+        )
+        analysis_jobs: list[Callable[[], Any]] = []
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            self._check_cancelled()
+            log(
+                f"Xếp hàng phân tích phần {chunk_index}/{len(chunks)} "
+                f"({format_timestamp(chunk[0].start)} - {format_timestamp(chunk[-1].end)})..."
+            )
+            analysis_jobs.append(
+                lambda chunk=chunk, chunk_index=chunk_index: client.find_candidates(
+                    chunk,
+                    config.min_duration,
+                    config.max_duration,
+                    candidate_limit,
+                    config.extra_instructions,
+                    chunk_index,
+                    len(chunks),
+                )
+            )
+        analysis_payloads = run_parallel_api_jobs(
+            analysis_jobs, config.api_concurrency, self.cancel_event
+        )
+        candidates: list[ShortPlan] = []
+        for chunk_index, (chunk, payload) in enumerate(zip(chunks, analysis_payloads), start=1):
+            normalized = normalize_candidates(
+                payload, chunk, config.min_duration, config.max_duration, video_duration
+            )
+            candidates.extend(normalized)
+            log(f"Phần {chunk_index}: nhận {len(normalized)} ứng viên hợp lệ.")
+        plans = select_best_candidates(candidates, config.max_shorts)
+        if not plans:
+            raise RuntimeError(
+                "Gemini không chọn được đoạn nào hợp lệ. Hãy giảm thời lượng min hoặc đổi yêu cầu thêm."
+            )
+        log(f"Đã chọn {len(plans)} short sau khi loại đoạn trùng.")
+
+        run_dir = build_run_directory(config.output_dir / safe_filename(video_path.stem, "video"))
+        log(f"Thư mục phiên chạy: {run_dir}")
+        metadata_jobs: list[Callable[[], Any]] = []
+        for index, plan in enumerate(plans, start=1):
+            self._check_cancelled()
+            segment_cues = cues_for_range(cues, plan.start, plan.end)
+            metadata_jobs.append(
+                lambda plan=plan, segment_cues=segment_cues, index=index: client.create_metadata(
+                    plan, segment_cues, index, video_path.name
+                )
+            )
+        log(f"Tạo metadata cho {len(metadata_jobs)} short...")
+        metadata_results = run_parallel_api_jobs(
+            metadata_jobs, config.api_concurrency, self.cancel_event
+        )
+
+        for index, (plan, metadata) in enumerate(zip(plans, metadata_results), start=1):
+            self._check_cancelled()
+            plan.title = metadata["title"]
+            plan.description = metadata["description"]
+            plan.thumbnail_prompt = metadata["thumbnail_prompt"]
+
+            slug = safe_filename(plan.title, f"short_{index:02d}")
+            prefix = f"short_{index:02d}_{slug}"
+            clip_srt = run_dir / f"{prefix}.srt"
+            metadata_path = run_dir / f"{prefix}_metadata.txt"
+            clip_video = run_dir / f"{prefix}.mp4"
+            write_clipped_srt(cues, plan.start, plan.end, clip_srt)
+            write_metadata(metadata_path, plan, index)
+            plan.subtitle_path = str(clip_srt)
+            plan.metadata_path = str(metadata_path)
+            log(f"Short {index}: đang cắt và chuyển sang video dọc 1080x1920...")
+            run_ffmpeg(
+                video_path,
+                clip_video,
+                plan.start,
+                plan.duration,
+                config.vertical_mode,
+                clip_srt if config.burn_subtitles else None,
+                log,
+                self.cancel_event,
+            )
+            plan.video_path = str(clip_video)
+            log(f"Short {index} hoàn tất: {clip_video.name}")
+            self._write_plan_json(run_dir, config, video_path, srt_path, plans, video_duration, repaired)
+
+        self._write_plan_json(run_dir, config, video_path, srt_path, plans, video_duration, repaired)
+        return run_dir
+
+    def _create_srt(
+        self, config: RunConfig, video_path: Path, srt_path: Path, log: Callable[[str], None]
+    ) -> None:
+        if not config.auto_srt:
+            raise RuntimeError(f"Thiếu file SRT: {srt_path.name}")
+        duration = probe_duration(video_path)
+        log(f"Chưa có SRT, Gemini A ({config.srt_model}) đang tách SRT từ video...")
+        client = GeminiJsonClient(config.srt_api_key, config.srt_model, log, self.cancel_event)
+        cues = transcribe_media(
+            client, video_path, duration, config.output_dir / "_srt_work", log, self.cancel_event
+        )
+        write_generated_srt(cues, srt_path)
+        log(f"Đã tạo SRT: {srt_path} ({len(cues)} cue).")
 
     @staticmethod
     def _write_plan_json(
         run_dir: Path,
         config: RunConfig,
+        video_path: Path,
+        srt_path: Path,
         plans: Sequence[ShortPlan],
         video_duration: float,
         srt_encoding_repaired: bool,
     ) -> None:
         payload = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "source_video": str(config.video_path),
-            "source_srt": str(config.srt_path),
+            "source_video": str(video_path),
+            "source_srt": str(srt_path),
             "source_duration_seconds": round(video_duration, 3),
             "model": config.model,
+            "srt_model": config.srt_model,
             "api_concurrency": config.api_concurrency,
             "vertical_mode": config.vertical_mode,
             "burn_subtitles": config.burn_subtitles,
@@ -1195,10 +1338,21 @@ class ShortCutterApp:
                 if kind == "log":
                     self._append_log(str(payload))
                 elif kind == "complete":
-                    self.last_output_var.set(str(payload))
-                    self.status_var.set("Hoàn tất")
+                    output_dir, results = payload
+                    self.last_output_var.set(str(output_dir))
+                    failed = [(video, error) for video, _, error in results if error]
+                    self.status_var.set(
+                        "Hoàn tất" if not failed else f"Xong, {len(failed)} video lỗi"
+                    )
                     self._set_idle()
-                    messagebox.showinfo("Hoàn tất", f"Đã tạo xong các short tại:\n{payload}")
+                    summary = f"Đã xử lý {len(results)} video, kết quả tại:\n{output_dir}"
+                    if failed:
+                        summary += "\n\nVideo lỗi:\n" + "\n".join(
+                            f"- {video.name}: {error}" for video, error in failed
+                        )
+                        messagebox.showwarning("Hoàn tất (có lỗi)", summary)
+                    else:
+                        messagebox.showinfo("Hoàn tất", summary)
                 elif kind == "cancelled":
                     self.status_var.set("Đã dừng")
                     self._set_idle()

@@ -8,7 +8,28 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .media_utils import escape_concat_path, escape_filter_path, probe_media
-from .models import Asset, EditPlan, EditSegment, MediaInfo, RunConfig
+from .models import Asset, Cue, DemoInsert, EditPlan, EditSegment, MediaInfo, RunConfig
+
+
+BOUNDARY_EPSILON = 0.02
+
+
+def shift_cues_for_demo_inserts(cues: Sequence[Cue], inserts: Sequence[DemoInsert]) -> list[Cue]:
+    """Move narration cues later by the length of every demo played before them."""
+    if not inserts:
+        return list(cues)
+
+    def shifted(time: float, include_equal: bool) -> float:
+        return time + sum(
+            item.duration
+            for item in inserts
+            if item.insert_at < time - BOUNDARY_EPSILON
+            or (include_equal and abs(item.insert_at - time) <= BOUNDARY_EPSILON)
+        )
+
+    return [
+        Cue(cue.id, shifted(cue.start, True), shifted(cue.end, False), cue.text) for cue in cues
+    ]
 
 
 class FFmpegRenderer:
@@ -36,21 +57,48 @@ class FFmpegRenderer:
     ) -> Path:
         temp_dir = run_dir / "temp"
         temp_dir.mkdir(parents=True, exist_ok=True)
-        segment_paths: list[Path] = []
+        inserts = sorted(plan.demo_inserts, key=lambda item: (item.insert_at, item.source_start))
+        demo_paths: list[Path] = []
+        for index, item in enumerate(inserts, start=1):
+            self._check_cancelled()
+            self.logger(
+                f"Rendering demo insert {index}/{len(inserts)} with original audio "
+                f"({item.source_start:.2f}-{item.source_end:.2f}s)..."
+            )
+            clip_path = temp_dir / f"demo_{index:04d}.mp4"
+            self._render_demo_insert(item, clip_path, index)
+            demo_paths.append(clip_path)
+
+        timeline_paths: list[Path] = []
+        next_insert = 0
         for index, segment in enumerate(plan.segments, start=1):
             self._check_cancelled()
+            while (
+                next_insert < len(inserts)
+                and inserts[next_insert].insert_at <= segment.target_start + BOUNDARY_EPSILON
+            ):
+                timeline_paths.append(demo_paths[next_insert])
+                next_insert += 1
             self.logger(f"Rendering segment {index}/{len(plan.segments)}...")
             clip_path = temp_dir / f"segment_{index:04d}.mp4"
             self._render_segment(segment, clip_path, temp_dir, index)
-            segment_paths.append(clip_path)
+            timeline_paths.append(clip_path)
+        timeline_paths.extend(demo_paths[next_insert:])
 
         joined_path = temp_dir / "joined_visuals.mp4"
         self.logger("Concatenating rendered visual segments...")
-        self._concat_segments(segment_paths, temp_dir, joined_path)
+        self._concat_segments(timeline_paths, temp_dir, joined_path)
 
+        narration_path = self.config.target_voice
+        if inserts:
+            narration_path = temp_dir / "narration_with_demo_gaps.wav"
+            self.logger("Pausing the new narration at each demo insert...")
+            self._build_gapped_narration(inserts, plan.target_duration, narration_path)
+
+        final_duration = plan.final_duration
         output_path = run_dir / "final_video.mp4"
         self.logger("Muxing target narration...")
-        self._mux_final(joined_path, output_path, target_srt, plan.target_duration)
+        self._mux_final(joined_path, output_path, target_srt, narration_path, final_duration)
         if self.config.export_srt:
             subtitle_output = run_dir / "final_video.srt"
             if target_srt.resolve() != subtitle_output.resolve():
@@ -66,17 +114,128 @@ class FFmpegRenderer:
                 )
 
         info = probe_media(output_path)
-        difference = abs(info.duration - plan.target_duration)
+        difference = abs(info.duration - final_duration)
         if difference > 1.0:
             raise RuntimeError(
                 f"Final duration verification failed: video={info.duration:.3f}s, "
-                f"target voice={plan.target_duration:.3f}s."
+                f"expected={final_duration:.3f}s (target voice {plan.target_duration:.3f}s "
+                f"+ demo {plan.demo_duration:.3f}s)."
             )
         self.logger(
             f"Final verification passed: {info.duration:.3f}s "
-            f"(target {plan.target_duration:.3f}s)."
+            f"(target voice {plan.target_duration:.3f}s + demo {plan.demo_duration:.3f}s)."
         )
         return output_path
+
+    def _render_demo_insert(self, item: DemoInsert, output_path: Path, index: int) -> None:
+        duration = item.duration
+        video_filter = self._video_chain(
+            "[0:v]", duration, {"fitMode": "contain"}, source_duration=duration, speed=1.0, hold=0.0
+        )
+        audio_filter = (
+            f"[0:a]atrim=duration={duration:.3f},asetpts=PTS-STARTPTS,"
+            f"volume={item.volume:.4f},apad,atrim=duration={duration:.3f},"
+            "aresample=48000,aformat=channel_layouts=stereo[aout]"
+        )
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{item.source_start:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(self.config.source_video),
+            "-filter_complex",
+            video_filter + ";[vbase]null[vout];" + audio_filter,
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
+            *self._clip_encode_args(duration),
+            str(output_path),
+        ]
+        self._run(command, f"demo insert {index}")
+
+    def _build_gapped_narration(
+        self, inserts: Sequence[DemoInsert], target_duration: float, output_path: Path
+    ) -> None:
+        """Split the narration at each insert point and put silence of the demo length there."""
+        pieces: list[str] = []
+        filters: list[str] = []
+        cursor = 0.0
+        for item in inserts:
+            point = min(target_duration, max(cursor, item.insert_at))
+            if point > cursor + 0.001:
+                label = f"n{len(pieces)}"
+                filters.append(
+                    f"[0:a]atrim=start={cursor:.3f}:end={point:.3f},asetpts=PTS-STARTPTS,"
+                    f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]"
+                )
+                pieces.append(f"[{label}]")
+            label = f"s{len(pieces)}"
+            filters.append(
+                f"aevalsrc=0|0:c=stereo:s=48000:d={item.duration:.3f},"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]"
+            )
+            pieces.append(f"[{label}]")
+            cursor = point
+        if target_duration > cursor + 0.001:
+            label = f"n{len(pieces)}"
+            filters.append(
+                f"[0:a]atrim=start={cursor:.3f},asetpts=PTS-STARTPTS,"
+                f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[{label}]"
+            )
+            pieces.append(f"[{label}]")
+        filters.append("".join(pieces) + f"concat=n={len(pieces)}:v=0:a=1[aout]")
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(self.config.target_voice),
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[aout]",
+            "-c:a",
+            "pcm_s16le",
+            str(output_path),
+        ]
+        self._run(command, "narration with demo gaps")
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError("FFmpeg did not create the narration with demo gaps.")
+
+    def _clip_encode_args(self, duration: float) -> list[str]:
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            str(self.fps),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-t",
+            f"{duration:.3f}",
+            "-movflags",
+            "+faststart",
+        ]
 
     def _render_segment(
         self,
@@ -185,7 +344,8 @@ class FFmpegRenderer:
             source_duration = float(visual["sourceEnd"]) - float(visual["sourceStart"])
             audio_filter = (
                 f"[0:a]atrim=duration={source_duration:.3f},asetpts=PTS-STARTPTS,"
-                f"atempo={speed:.5f},apad,atrim=duration={duration:.3f},"
+                f"atempo={speed:.5f},volume={self.config.original_audio_volume:.4f},"
+                f"apad,atrim=duration={duration:.3f},"
                 "aresample=48000,aformat=channel_layouts=stereo[aout]"
             )
         else:
@@ -202,28 +362,7 @@ class FFmpegRenderer:
                 "[vout]",
                 "-map",
                 "[aout]",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "22",
-                "-pix_fmt",
-                "yuv420p",
-                "-r",
-                str(self.fps),
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-ar",
-                "48000",
-                "-ac",
-                "2",
-                "-t",
-                f"{duration:.3f}",
-                "-movflags",
-                "+faststart",
+                *self._clip_encode_args(duration),
                 str(output_path),
             ]
         )
@@ -398,7 +537,8 @@ class FFmpegRenderer:
         joined_path: Path,
         output_path: Path,
         target_srt: Path,
-        target_duration: float,
+        narration_path: Path,
+        final_duration: float,
     ) -> None:
         command = [
             "ffmpeg",
@@ -409,27 +549,20 @@ class FFmpegRenderer:
             "-i",
             str(joined_path),
             "-i",
-            str(self.config.target_voice),
+            str(narration_path),
         ]
-        audio_filter = ""
-        audio_map = "1:a:0"
-        if self.config.original_audio_mode == "background":
-            audio_filter = (
-                f"[0:a]volume={self.config.original_audio_volume:.4f}[background];"
-                "[1:a][background]amix=inputs=2:duration=first:"
-                "dropout_transition=0:normalize=0[mixed]"
-            )
-            audio_map = "[mixed]"
+        # The joined clips already carry the per-segment original audio: silence
+        # when muted, quiet background, and full-volume demo inserts.
+        audio_filter = (
+            "[1:a]aresample=48000,aformat=channel_layouts=stereo[narration];"
+            "[narration][0:a]amix=inputs=2:duration=longest:"
+            "dropout_transition=0:normalize=0[mixed]"
+        )
+        audio_map = "[mixed]"
         if self.config.normalize_audio:
-            input_label = audio_map
-            normalized_label = "[normalized]"
-            if audio_filter:
-                audio_filter += ";[mixed]loudnorm=I=-16:LRA=11:TP=-1.5[normalized]"
-            else:
-                audio_filter = "[1:a]loudnorm=I=-16:LRA=11:TP=-1.5[normalized]"
-            audio_map = normalized_label
-        if audio_filter:
-            command.extend(["-filter_complex", audio_filter])
+            audio_filter += ";[mixed]loudnorm=I=-16:LRA=11:TP=-1.5[normalized]"
+            audio_map = "[normalized]"
+        command.extend(["-filter_complex", audio_filter])
 
         if self.config.burn_subtitles:
             escaped_srt = escape_filter_path(target_srt)
@@ -468,7 +601,7 @@ class FFmpegRenderer:
                 "-ar",
                 "48000",
                 "-t",
-                f"{target_duration:.3f}",
+                f"{final_duration:.3f}",
                 "-movflags",
                 "+faststart",
                 str(output_path),
