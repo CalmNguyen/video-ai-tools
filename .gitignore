@@ -60,3 +60,5 @@ outputs/
 Thumbs.db
 Desktop.ini
 .DS_Store
+voiceover_work/
+*_voiced.mp4

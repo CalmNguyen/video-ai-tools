@@ -44,6 +44,11 @@ TOOLS = (
         ROOT / "gemini_video_meta.py",
     ),
     (
+        "Thêm giọng từ SRT vào video",
+        "Tải nhiều video, dán SRT cho từng video; TTS For Free đọc SRT rồi ghép giọng vào video gốc.",
+        ROOT / "gemini_srt_voiceover.py",
+    ),
+    (
         "Tải video (Bilibili, YouTube...)",
         "Tải video/audio bằng yt-dlp. Cần: pip install PySide6 yt-dlp.",
         ROOT / "download_bilibili" / "main.py",

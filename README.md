@@ -9,7 +9,25 @@ python main.py
 ```
 
 Launcher có: Cắt Short từ video dài, Full Video Editor, Tự lên kịch bản + TTS +
-dựng video, Sửa SRT bằng Gemini, và Tải video. Mỗi tool mở trong một cửa sổ riêng.
+dựng video, Sửa SRT bằng Gemini, Thêm giọng từ SRT vào video, và Tải video. Mỗi tool mở trong một cửa sổ riêng.
+
+## Thêm giọng từ SRT vào video (TTS For Free)
+
+Dành cho video gốc đã có âm thanh nhưng thiếu nhiều chỗ nói. Mở từ launcher hoặc chạy
+`python gemini_srt_voiceover.py`. Cần `pip install -U requests cryptography` và FFmpeg.
+
+1. Nhập TTS For Free API key và giọng (voice). Nếu đã nhập trong tool
+   "Tự lên kịch bản + TTS + dựng video" thì key, endpoint và voice được dùng chung tự động.
+2. `Thêm video...` chọn nhiều video một lần (file `.srt` cùng tên cạnh video sẽ tự nạp).
+3. Chọn từng video trong danh sách rồi dán SRT vào ô bên dưới (hoặc `Mở file .srt...`).
+4. Chỉnh âm gốc / giọng mới / `Hạ âm gốc khi giọng mới nói` nếu cần.
+5. Bấm `Tạo giọng + ghép vào video`. Mỗi video gọi API SRT-to-Speech
+   (`POST /api/TTS/CreateSrt`, poll `GET /api/TTS/Multi/Status/{id}`), giọng được đặt đúng
+   timestamp trong SRT, tự khớp tốc độ trong khoảng min–max, rồi ghép với âm thanh gốc.
+
+Kết quả: `<tên video>_voiced.mp4` (hình giữ nguyên, không encode lại nếu codec cho phép).
+File SRT và audio giọng được lưu ở thư mục `voiceover_work/`. Chạy lại cùng SRT/giọng thì dùng
+lại audio đã tạo, không tốn thêm credit (có thể tắt bằng checkbox).
 
 ## Sửa SRT bằng Gemini
 
