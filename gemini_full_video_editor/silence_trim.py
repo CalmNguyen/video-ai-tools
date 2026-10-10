@@ -2,7 +2,9 @@
 
 The MP3 is the master timeline: silences are found in it with ffmpeg `silencedetect`,
 every pause longer than `min_silence` is shortened to `keep_gap`, and the very same
-time ranges are removed from the video so picture and voice stay in sync.
+time ranges are removed from the video so picture and voice stay in sync. The same
+render pass can also reframe the video (9:16) and lay a looping background music
+track under the result.
 """
 
 from __future__ import annotations
@@ -30,6 +32,17 @@ LAYOUTS = {
     LAYOUT_VERTICAL_BLUR: "Dọc 9:16 - giữ đủ hình, nền mờ",
     LAYOUT_VERTICAL_CROP: "Dọc 9:16 - phóng to, cắt 2 bên",
 }
+# "auto" = vertical (blurred background) when the trimmed video is short enough for a Short.
+LAYOUT_AUTO = "auto"
+DEFAULT_SHORT_LIMIT = 60
+LAYOUT_LABELS = {LAYOUT_AUTO: "Tự động: video ngắn → dọc nền mờ, dài → ngang", **LAYOUTS}
+LAYOUT_SHORT = {
+    LAYOUT_AUTO: "Tự động",
+    LAYOUT_ORIGINAL: "Ngang",
+    LAYOUT_VERTICAL_BLUR: "Dọc (nền mờ)",
+    LAYOUT_VERTICAL_CROP: "Dọc (cắt 2 bên)",
+}
+VERTICAL_SUFFIX = "_9x16"
 VERTICAL_SIZE = (1080, 1920)
 # MP3 encoder padding makes the file a few frames longer than the last silence_end.
 EDGE_TOLERANCE = 0.25
@@ -48,6 +61,23 @@ class TrimOptions:
     keep_gap: float = DEFAULT_KEEP_GAP_MS / 1000
     # Also shorten silence before the first and after the last word.
     trim_edges: bool = False
+
+
+@dataclass(frozen=True)
+class MusicOptions:
+    path: Path
+    # Background music level relative to its file (0.15 = 15%).
+    volume: float = 0.15
+    # Lower the music further while someone is speaking.
+    duck: bool = True
+    fade_in: float = 1.0
+    fade_out: float = 2.0
+
+
+def resolve_layout(layout: str, new_duration: float, short_limit: float) -> str:
+    if layout != LAYOUT_AUTO:
+        return layout
+    return LAYOUT_VERTICAL_BLUR if new_duration <= short_limit else LAYOUT_ORIGINAL
 
 
 @dataclass(frozen=True)
@@ -161,6 +191,11 @@ def plan_cuts(
     )
 
 
+def no_cut_plan(duration: float) -> TrimPlan:
+    """Keep everything (used when only reframing / adding music)."""
+    return plan_cuts([], duration, TrimOptions())
+
+
 def analyze(
     audio: Path,
     options: TrimOptions,
@@ -189,10 +224,13 @@ def build_filter_graph(
     duration: float,
     video_pad: float = 0.0,
     layout: str = LAYOUT_ORIGINAL,
+    music: MusicOptions | None = None,
+    music_input: int = 0,
 ) -> str:
     """trim/atrim every kept piece and concat them back together. Both streams are
     first padded to `duration` (silence / frozen last frame) so they line up; the
-    frame layout is applied once after concat so cut frames are never scaled."""
+    frame layout and background music are applied once after concat, so cut frames
+    are never scaled and the music plays on without jumps."""
     count = len(keeps)
     lines: list[str] = []
     if video:
@@ -211,11 +249,40 @@ def build_filter_graph(
             pieces.append(f"[v{i}]")
         lines.append(f"[as{i}]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{i}]")
         pieces.append(f"[a{i}]")
-    out = "[vcat][aout]" if video else "[aout]"
+    out = "[vcat][acat]" if video else "[acat]"
     lines.append("".join(pieces) + f"concat=n={count}:v={1 if video else 0}:a=1{out}")
     if video:
         lines.append(layout_filter(layout, "[vcat]", "[vout]"))
+    new_duration = sum(end - start for start, end in keeps)
+    lines.append(music_filter(music, music_input, new_duration, "[acat]", "[aout]"))
     return ";\n".join(lines)
+
+
+def music_filter(
+    music: MusicOptions | None, music_input: int, duration: float, source: str, output: str
+) -> str:
+    stereo = "aformat=sample_rates=48000:channel_layouts=stereo"
+    if music is None:
+        return f"{source}{stereo}{output}"
+    # The input is looped with -stream_loop -1, so a short track simply repeats.
+    fade_in = max(0.0, min(music.fade_in, duration / 2))
+    fade_out = max(0.0, min(music.fade_out, duration / 2))
+    bgm = (
+        f"[{music_input}:a]{stereo},atrim=end={duration:.6f},asetpts=PTS-STARTPTS,"
+        f"volume={max(0.0, music.volume):.3f}"
+    )
+    if fade_in > 0:
+        bgm += f",afade=t=in:d={fade_in:.3f}"
+    if fade_out > 0:
+        bgm += f",afade=t=out:st={duration - fade_out:.6f}:d={fade_out:.3f}"
+    mix = "amix=inputs=2:duration=first:dropout_transition=0:normalize=0"
+    if music.duck:
+        return (
+            f"{source}{stereo},asplit=2[amain][asc];{bgm}[bgm_raw];"
+            "[bgm_raw][asc]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=500[bgm];"
+            f"[amain][bgm]{mix}{output}"
+        )
+    return f"{source}{stereo}[amain];{bgm}[bgm];[amain][bgm]{mix}{output}"
 
 
 def layout_filter(layout: str, source: str, output: str) -> str:
@@ -296,21 +363,34 @@ def _run_with_progress(
 
 def render_trimmed(
     plan: TrimPlan,
-    audio: Path,
+    audio: Path | None,
     output: Path,
     *,
     video: Path | None = None,
     video_duration: float = 0.0,
     fps: float = DEFAULT_FPS,
     layout: str = LAYOUT_ORIGINAL,
+    music: MusicOptions | None = None,
     crf: int = 18,
     audio_bitrate: str = "192k",
     on_progress: Callable[[float], None] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> Path:
-    """Write the cut MP4 (video + MP3 voice), or a cut MP3 when `video` is None."""
+    """Write the cut MP4 (video + MP3 voice), or a cut MP3 when `video` is None.
+    `audio=None` uses the video's own audio track."""
     if not plan.keeps:
         raise RuntimeError("Không còn đoạn nào để giữ lại.")
+    if audio is None and video is None:
+        raise ValueError("Cần audio hoặc video.")
+    inputs: list[str] = []
+    if video is not None:
+        inputs += ["-i", str(video)]
+    if audio is not None:
+        inputs += ["-i", str(audio)]
+    audio_input = 1 if video is not None and audio is not None else 0
+    music_input = len(inputs) // 2
+    if music is not None:
+        inputs += ["-stream_loop", "-1", "-i", str(music.path)]
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_name(output.stem + ".part" + output.suffix)
     with tempfile.TemporaryDirectory(prefix="silence_trim_") as tmp:
@@ -320,17 +400,19 @@ def render_trimmed(
                 plan.keeps,
                 video=video is not None,
                 fps=fps,
-                audio_input=1 if video else 0,
+                audio_input=audio_input,
                 duration=plan.duration,
                 video_pad=max(0.0, plan.duration - video_duration) if video_duration > 0 else 0.0,
                 layout=layout,
+                music=music,
+                music_input=music_input,
             ),
             encoding="utf-8",
         )
-        command = ["ffmpeg", "-y", "-hide_banner", "-nostats", "-progress", "pipe:1"]
-        if video is not None:
-            command += ["-i", str(video)]
-        command += ["-i", str(audio), *_filter_script_args(script)]
+        command = [
+            "ffmpeg", "-y", "-hide_banner", "-nostats", "-progress", "pipe:1",
+            *inputs, *_filter_script_args(script),
+        ]
         if video is not None:
             command += [
                 "-map", "[vout]", "-map", "[aout]",

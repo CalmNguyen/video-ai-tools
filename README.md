@@ -25,7 +25,19 @@ Dành cho video gốc đã có âm thanh nhưng thiếu nhiều chỗ nói. Mở
    (`POST /api/TTS/CreateSrt`, poll `GET /api/TTS/Multi/Status/{id}`), giọng được đặt đúng
    timestamp trong SRT, tự khớp tốc độ trong khoảng min–max, rồi ghép với âm thanh gốc.
 
-Kết quả: `<tên video>_voiced.mp4` (hình giữ nguyên, không encode lại nếu codec cho phép).
+6. (Tùy chọn) Khung `Sau khi ghép giọng` để ra luôn video hoàn chỉnh:
+   - `Cắt bớt khoảng lặng giữa 2 câu` (mặc định bật): giống tool Cắt khoảng lặng, rút các chỗ
+     ngừng dài còn `Giữ lại` ms (mặc định 200). `Dò khoảng lặng theo`:
+     `Âm thanh sau khi ghép` (mặc định) chỉ cắt chỗ cả giọng mới lẫn âm gốc đều im, nên tiếng
+     demo trong video gốc không bị mất; `Chỉ giọng mới` cắt theo giọng TTS, bỏ qua âm gốc.
+   - `Khung xuất`: Ngang (mặc định), Dọc 9:16 nền mờ, Dọc 9:16 cắt 2 bên, hoặc Tự động (bản
+     cuối ≤ 60 giây thì xuất dọc để làm Short). Đặt riêng từng video bằng `Áp dụng cho dòng chọn`.
+   - `Nhạc nền`: tick và chọn file nhạc, chỉnh âm lượng (mặc định 15%), `Hạ nhạc khi có tiếng
+     nói`, fade in/out. Nhạc ngắn hơn video thì tự lặp lại cho đủ.
+
+Kết quả: `<tên video>_voiced.mp4` (bản dọc `<tên video>_voiced_9x16.mp4`). Nếu không cắt khoảng
+lặng, không nhạc nền và để khung Ngang thì hình giữ nguyên, không encode lại; bật một trong các
+mục đó thì video được encode lại một lần (H.264, CRF 18).
 File SRT và audio giọng được lưu ở thư mục `voiceover_work/`. Chạy lại cùng SRT/giọng thì dùng
 lại audio đã tạo, không tốn thêm credit (có thể tắt bằng checkbox).
 

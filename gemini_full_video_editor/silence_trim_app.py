@@ -19,13 +19,17 @@ from .silence_trim import (
     DEFAULT_KEEP_GAP_MS,
     DEFAULT_MIN_SILENCE_MS,
     DEFAULT_NOISE_DB,
+    DEFAULT_SHORT_LIMIT,
+    LAYOUT_AUTO,
+    LAYOUT_LABELS,
     LAYOUT_ORIGINAL,
-    LAYOUT_VERTICAL_BLUR,
-    LAYOUTS,
+    LAYOUT_SHORT,
+    VERTICAL_SUFFIX,
     TrimOptions,
     TrimPlan,
     analyze,
     render_trimmed,
+    resolve_layout,
 )
 from .srt_utils import format_timestamp
 
@@ -43,18 +47,7 @@ MEDIA_TYPES = (
 AUDIO_TYPES = (("Audio", " ".join(f"*{ext}" for ext in sorted(AUDIO_EXTS))), ("All files", "*.*"))
 VIDEO_TYPES = (("Video", " ".join(f"*{ext}" for ext in sorted(VIDEO_EXTS))), ("All files", "*.*"))
 OUTPUT_SUFFIX = "_trimmed"
-VERTICAL_SUFFIX = "_9x16"
 MAX_PARALLEL = 8
-LAYOUT_AUTO = "auto"
-DEFAULT_SHORT_LIMIT = 60
-LAYOUT_LABELS = {LAYOUT_AUTO: "Tự động: video ngắn → dọc nền mờ, dài → ngang", **LAYOUTS}
-LAYOUT_SHORT = {
-    LAYOUT_AUTO: "Tự động",
-    LAYOUT_ORIGINAL: "Ngang",
-    "vertical_blur": "Dọc (nền mờ)",
-    "vertical_crop": "Dọc (cắt 2 bên)",
-}
-
 
 def short_time(seconds: float) -> str:
     text = format_timestamp(seconds)
@@ -68,12 +61,6 @@ def clock(seconds: float) -> str:
 
 def pair_key(path: Path) -> str:
     return path.stem.strip().lower()
-
-
-def resolve_layout(layout: str, new_duration: float, short_limit: float) -> str:
-    if layout != LAYOUT_AUTO:
-        return layout
-    return LAYOUT_VERTICAL_BLUR if new_duration <= short_limit else LAYOUT_ORIGINAL
 
 
 @dataclass(frozen=True)

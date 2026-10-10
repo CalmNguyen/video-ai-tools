@@ -15,6 +15,23 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from .media_utils import ensure_ffmpeg, probe_media
 from .settings import SettingsStore
+from .silence_trim import (
+    DEFAULT_FPS,
+    DEFAULT_KEEP_GAP_MS,
+    DEFAULT_MIN_SILENCE_MS,
+    DEFAULT_NOISE_DB,
+    DEFAULT_SHORT_LIMIT,
+    LAYOUT_LABELS,
+    LAYOUT_ORIGINAL,
+    LAYOUT_SHORT,
+    VERTICAL_SUFFIX,
+    MusicOptions,
+    TrimOptions,
+    analyze,
+    no_cut_plan,
+    render_trimmed,
+    resolve_layout,
+)
 from .srt_utils import format_timestamp, parse_srt, read_text_file
 from .ttsforfree_srt import (
     DEFAULT_BLOCK_SPEED,
@@ -39,12 +56,29 @@ VIDEO_TYPES = (
 WORK_DIR_NAME = "voiceover_work"
 OUTPUT_SUFFIX = "_voiced"
 MAX_PARALLEL_VIDEOS = 4
+MUSIC_TYPES = (
+    ("Audio", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
+    ("All files", "*.*"),
+)
+# Where pauses are looked for before shortening them.
+DETECT_MIX = "mix"
+DETECT_VOICE = "voice"
+DETECT_LABELS = {
+    DETECT_MIX: "Âm thanh sau khi ghép (giọng mới + âm gốc)",
+    DETECT_VOICE: "Chỉ giọng mới (TTS)",
+}
+
+
+def clock(seconds: float) -> str:
+    minutes, secs = divmod(int(round(seconds)), 60)
+    return f"{minutes}:{secs:02d}"
 
 
 @dataclass
 class VideoItem:
     path: Path
     srt_text: str = ""
+    layout: str = LAYOUT_ORIGINAL
     status: str = "-"
     output: Path | None = None
 
@@ -67,8 +101,8 @@ class VoiceoverWindow:
     def __init__(self, window: tk.Tk | tk.Toplevel):
         self.window = window
         self.window.title("SRT → Giọng TTS For Free → Ghép vào video")
-        self.window.geometry("1180x820")
-        self.window.minsize(920, 660)
+        self.window.geometry("1180x940")
+        self.window.minsize(920, 760)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker: threading.Thread | None = None
@@ -89,6 +123,21 @@ class VoiceoverWindow:
         self.reuse_var = tk.BooleanVar(value=True)
         self.parallel_var = tk.StringVar(value="2")
         self.output_dir_var = tk.StringVar()
+        # Finishing after the voice is mixed in: shorten pauses, reframe, background music.
+        self.trim_var = tk.BooleanVar(value=True)
+        self.keep_gap_var = tk.StringVar(value=str(DEFAULT_KEEP_GAP_MS))
+        self.min_silence_var = tk.StringVar(value=str(DEFAULT_MIN_SILENCE_MS))
+        self.noise_var = tk.StringVar(value=f"{DEFAULT_NOISE_DB:g}")
+        self.detect_var = tk.StringVar(value=DETECT_LABELS[DETECT_MIX])
+        self.trim_edges_var = tk.BooleanVar(value=False)
+        self.layout_var = tk.StringVar(value=LAYOUT_LABELS[LAYOUT_ORIGINAL])
+        self.short_limit_var = tk.StringVar(value=str(DEFAULT_SHORT_LIMIT))
+        self.music_var = tk.BooleanVar(value=False)
+        self.music_path_var = tk.StringVar()
+        self.music_volume_var = tk.StringVar(value="15")
+        self.music_duck_var = tk.BooleanVar(value=True)
+        self.music_fade_in_var = tk.StringVar(value="1")
+        self.music_fade_out_var = tk.StringVar(value="2")
         self.srt_info_var = tk.StringVar(value="Chọn một video để dán SRT.")
         self.status_var = tk.StringVar(
             value="Thêm video, chọn từng video rồi dán SRT (hoặc mở file .srt), sau đó bấm Tạo giọng + ghép."
@@ -104,8 +153,8 @@ class VoiceoverWindow:
         main = ttk.Frame(self.window, padding=10)
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(2, weight=1)
-        main.rowconfigure(4, weight=2)
+        main.rowconfigure(3, weight=1)
+        main.rowconfigure(5, weight=2)
 
         api = ttk.LabelFrame(main, text="TTS For Free", padding=6)
         api.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -164,15 +213,22 @@ class VoiceoverWindow:
         )
 
         list_frame = ttk.Frame(main)
-        list_frame.grid(row=2, column=0, sticky="nsew")
+        self._build_finish(main)
+
+        list_frame.grid(row=3, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
         self.tree = ttk.Treeview(
-            list_frame, columns=("video", "srt", "status"), show="headings", selectmode="extended", height=6
+            list_frame,
+            columns=("video", "srt", "layout", "status"),
+            show="headings",
+            selectmode="extended",
+            height=6,
         )
         for column, title, width in (
-            ("video", "Video", 460),
-            ("srt", "SRT", 200),
+            ("video", "Video", 400),
+            ("srt", "SRT", 180),
+            ("layout", "Khung", 130),
             ("status", "Trạng thái", 340),
         ):
             self.tree.heading(column, text=title)
@@ -185,7 +241,7 @@ class VoiceoverWindow:
         self.tree.bind("<Double-1>", self._open_output)
 
         actions = ttk.Frame(main)
-        actions.grid(row=3, column=0, sticky="ew", pady=6)
+        actions.grid(row=4, column=0, sticky="ew", pady=6)
         ttk.Button(actions, text="Thêm video...", command=self._add_videos).pack(side="left")
         ttk.Button(actions, text="Xóa đã chọn", command=self._remove_selected).pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="Xóa hết", command=self._clear).pack(side="left", padx=(6, 0))
@@ -199,7 +255,7 @@ class VoiceoverWindow:
         )
 
         srt_frame = ttk.LabelFrame(main, text="SRT của video đang chọn (dán text SRT vào đây)", padding=6)
-        srt_frame.grid(row=4, column=0, sticky="nsew")
+        srt_frame.grid(row=5, column=0, sticky="nsew")
         srt_frame.columnconfigure(0, weight=1)
         srt_frame.rowconfigure(1, weight=1)
         bar = ttk.Frame(srt_frame)
@@ -215,7 +271,72 @@ class VoiceoverWindow:
         self.srt_text.bind("<FocusOut>", self._on_text_changed)
         self.srt_text.configure(state="disabled")
 
-        ttk.Label(main, textvariable=self.status_var).grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(main, textvariable=self.status_var).grid(row=6, column=0, sticky="w", pady=(6, 0))
+
+    def _build_finish(self, main: ttk.Frame) -> None:
+        box = ttk.LabelFrame(main, text="Sau khi ghép giọng: cắt khoảng lặng, khung xuất, nhạc nền", padding=6)
+        box.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+
+        trim = ttk.Frame(box)
+        trim.pack(fill="x")
+        ttk.Checkbutton(trim, text="Cắt bớt khoảng lặng giữa 2 câu", variable=self.trim_var).pack(side="left")
+        ttk.Label(trim, text="Giữ lại (ms)").pack(side="left", padx=(12, 4))
+        ttk.Spinbox(trim, textvariable=self.keep_gap_var, from_=0, to=2000, increment=50, width=6).pack(side="left")
+        ttk.Label(trim, text="Chỉ cắt khi lặng dài hơn (ms)").pack(side="left", padx=(12, 4))
+        ttk.Spinbox(trim, textvariable=self.min_silence_var, from_=100, to=10000, increment=50, width=6).pack(
+            side="left"
+        )
+        ttk.Label(trim, text="Ngưỡng (dB)").pack(side="left", padx=(12, 4))
+        ttk.Spinbox(trim, textvariable=self.noise_var, from_=-80, to=-10, increment=5, width=5).pack(side="left")
+        ttk.Checkbutton(trim, text="Cắt cả đầu/cuối", variable=self.trim_edges_var).pack(side="left", padx=(12, 0))
+
+        detect = ttk.Frame(box)
+        detect.pack(fill="x", pady=(4, 0))
+        ttk.Label(detect, text="Dò khoảng lặng theo").pack(side="left")
+        ttk.Combobox(
+            detect, textvariable=self.detect_var, values=list(DETECT_LABELS.values()), state="readonly", width=40
+        ).pack(side="left", padx=(4, 0))
+        ttk.Label(
+            detect, text="(video gốc có tiếng/demo cần giữ thì để 'sau khi ghép'; chỉ cắt khi cả 2 cùng im)"
+        ).pack(side="left", padx=(8, 0))
+
+        layout = ttk.Frame(box)
+        layout.pack(fill="x", pady=(4, 0))
+        ttk.Label(layout, text="Khung xuất").pack(side="left")
+        ttk.Combobox(
+            layout, textvariable=self.layout_var, values=list(LAYOUT_LABELS.values()), state="readonly", width=44
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(layout, text="Áp dụng cho dòng chọn", command=self._apply_layout).pack(side="left", padx=(6, 0))
+        ttk.Label(layout, text="Tự động: dọc nếu bản cuối ≤").pack(side="left", padx=(12, 4))
+        ttk.Spinbox(layout, textvariable=self.short_limit_var, from_=10, to=600, increment=10, width=5).pack(
+            side="left"
+        )
+        ttk.Label(layout, text="giây").pack(side="left", padx=(4, 0))
+
+        music = ttk.Frame(box)
+        music.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(music, text="Nhạc nền", variable=self.music_var).pack(side="left")
+        ttk.Entry(music, textvariable=self.music_path_var, width=40).pack(side="left", padx=(4, 0), fill="x", expand=True)
+        ttk.Button(music, text="Chọn...", command=self._choose_music).pack(side="left", padx=(6, 0))
+        ttk.Label(music, text="Âm lượng %").pack(side="left", padx=(12, 4))
+        ttk.Spinbox(music, textvariable=self.music_volume_var, from_=0, to=200, increment=5, width=5).pack(side="left")
+        ttk.Checkbutton(music, text="Hạ nhạc khi có tiếng nói", variable=self.music_duck_var).pack(
+            side="left", padx=(12, 0)
+        )
+        ttk.Label(music, text="Fade in/out (s)").pack(side="left", padx=(12, 4))
+        ttk.Spinbox(music, textvariable=self.music_fade_in_var, from_=0, to=10, increment=0.5, width=4).pack(
+            side="left"
+        )
+        ttk.Spinbox(music, textvariable=self.music_fade_out_var, from_=0, to=10, increment=0.5, width=4).pack(
+            side="left", padx=(4, 0)
+        )
+        ttk.Label(
+            box,
+            text="Nhạc ngắn hơn video sẽ tự lặp lại. Bản dọc lưu tên *_voiced_9x16.mp4. "
+            "Áp dụng khung: không chọn dòng nào = đổi tất cả.",
+        ).pack(
+            anchor="w", pady=(4, 0)
+        )
 
     # ---------- settings ----------
     def _load_settings(self) -> None:
@@ -241,6 +362,23 @@ class VoiceoverWindow:
         self.reuse_var.set(bool(data.get("reuse", True)))
         self.parallel_var.set(str(data.get("parallel", self.parallel_var.get())))
         self.output_dir_var.set(str(data.get("output_dir", "")))
+        self.trim_var.set(bool(data.get("trim", True)))
+        for key, var in (
+            ("keep_gap_ms", self.keep_gap_var),
+            ("min_silence_ms", self.min_silence_var),
+            ("noise_db", self.noise_var),
+            ("short_limit", self.short_limit_var),
+            ("music_path", self.music_path_var),
+            ("music_volume", self.music_volume_var),
+            ("music_fade_in", self.music_fade_in_var),
+            ("music_fade_out", self.music_fade_out_var),
+        ):
+            var.set(str(data.get(key, var.get())))
+        self.trim_edges_var.set(bool(data.get("trim_edges", False)))
+        self.detect_var.set(DETECT_LABELS.get(str(data.get("detect", "")), self.detect_var.get()))
+        self.layout_var.set(LAYOUT_LABELS.get(str(data.get("layout", "")), self.layout_var.get()))
+        self.music_var.set(bool(data.get("music", False)))
+        self.music_duck_var.set(bool(data.get("music_duck", True)))
 
     def _save_settings(self) -> None:
         remember = self.remember_key_var.get()
@@ -256,10 +394,45 @@ class VoiceoverWindow:
                 "reuse": self.reuse_var.get(),
                 "parallel": self.parallel_var.get().strip(),
                 "output_dir": self.output_dir_var.get().strip(),
+                "trim": self.trim_var.get(),
+                "keep_gap_ms": self.keep_gap_var.get().strip(),
+                "min_silence_ms": self.min_silence_var.get().strip(),
+                "noise_db": self.noise_var.get().strip(),
+                "trim_edges": self.trim_edges_var.get(),
+                "detect": self._label_key(DETECT_LABELS, self.detect_var, DETECT_MIX),
+                "layout": self._label_key(LAYOUT_LABELS, self.layout_var, LAYOUT_ORIGINAL),
+                "short_limit": self.short_limit_var.get().strip(),
+                "music": self.music_var.get(),
+                "music_path": self.music_path_var.get().strip(),
+                "music_volume": self.music_volume_var.get().strip(),
+                "music_duck": self.music_duck_var.get(),
+                "music_fade_in": self.music_fade_in_var.get().strip(),
+                "music_fade_out": self.music_fade_out_var.get().strip(),
                 "remember_api_key": remember,
                 "api_key": self.api_key_var.get().strip() if remember else "",
             }
         )
+
+    @staticmethod
+    def _label_key(labels: dict[str, str], var: tk.StringVar, default: str) -> str:
+        return next((key for key, text in labels.items() if text == var.get()), default)
+
+    def _choose_music(self) -> None:
+        path = filedialog.askopenfilename(parent=self.window, title="Chọn nhạc nền", filetypes=MUSIC_TYPES)
+        if path:
+            self.music_path_var.set(path)
+            self.music_var.set(True)
+
+    def _apply_layout(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Đang chạy", "Dừng queue trước khi đổi khung.", parent=self.window)
+            return
+        layout = self._label_key(LAYOUT_LABELS, self.layout_var, LAYOUT_ORIGINAL)
+        ids = list(self.tree.selection()) or list(self.tree.get_children())
+        for iid in ids:
+            self.items[iid].layout = layout
+            self._refresh_row(iid)
+        self.status_var.set(f"Đã đặt khung '{LAYOUT_SHORT[layout]}' cho {len(ids)} video.")
 
     # ---------- list handling ----------
     def _choose_output_dir(self) -> None:
@@ -275,7 +448,7 @@ class VoiceoverWindow:
             iid = str(path)
             if iid in self.items:
                 continue
-            item = VideoItem(path=path)
+            item = VideoItem(path=path, layout=self._label_key(LAYOUT_LABELS, self.layout_var, LAYOUT_ORIGINAL))
             sidecar = path.with_suffix(".srt")
             if sidecar.is_file():
                 try:
@@ -284,7 +457,12 @@ class VoiceoverWindow:
                 except OSError:
                     pass
             self.items[iid] = item
-            self.tree.insert("", "end", iid=iid, values=(str(path), cue_summary(item.srt_text), item.status))
+            self.tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(str(path), cue_summary(item.srt_text), LAYOUT_SHORT[item.layout], item.status),
+            )
             first_new = first_new or iid
         if first_new and not self.tree.selection():
             self.tree.selection_set(first_new)
@@ -292,7 +470,10 @@ class VoiceoverWindow:
     def _refresh_row(self, iid: str) -> None:
         if self.tree.exists(iid) and iid in self.items:
             item = self.items[iid]
-            self.tree.item(iid, values=(str(item.path), cue_summary(item.srt_text), item.status))
+            self.tree.item(
+                iid,
+                values=(str(item.path), cue_summary(item.srt_text), LAYOUT_SHORT[item.layout], item.status),
+            )
 
     def _busy(self) -> bool:
         if self.worker and self.worker.is_alive():
@@ -423,6 +604,30 @@ class VoiceoverWindow:
             raise ValueError("Tốc độ đọc, âm lượng và số video song song phải là số.") from None
         if min(orig_volume, voice_volume) < 0:
             raise ValueError("Âm lượng không được âm.")
+        try:
+            keep_gap = float(self.keep_gap_var.get()) / 1000
+            min_silence = float(self.min_silence_var.get()) / 1000
+            noise_db = float(self.noise_var.get())
+            short_limit = float(self.short_limit_var.get())
+            music_volume = float(self.music_volume_var.get()) / 100
+            fade_in = float(self.music_fade_in_var.get())
+            fade_out = float(self.music_fade_out_var.get())
+        except ValueError:
+            raise ValueError("Thông số cắt khoảng lặng / khung / nhạc nền phải là số.") from None
+        if self.trim_var.get() and (keep_gap < 0 or min_silence <= keep_gap):
+            raise ValueError("'Chỉ cắt khi lặng dài hơn' phải lớn hơn 'Giữ lại'.")
+        music = None
+        if self.music_var.get():
+            music_path = Path(self.music_path_var.get().strip().strip('"'))
+            if not music_path.is_file():
+                raise ValueError("Đã tick Nhạc nền nhưng chưa chọn file nhạc (hoặc file không tồn tại).")
+            music = MusicOptions(
+                path=music_path,
+                volume=max(0.0, music_volume),
+                duck=self.music_duck_var.get(),
+                fade_in=max(0.0, fade_in),
+                fade_out=max(0.0, fade_out),
+            )
         return {
             "endpoint": self.endpoint_var.get().strip(),
             "api_key": api_key,
@@ -437,6 +642,19 @@ class VoiceoverWindow:
             "reuse": self.reuse_var.get(),
             "parallel": max(1, min(MAX_PARALLEL_VIDEOS, parallel)),
             "output_dir": self.output_dir_var.get().strip(),
+            "trim": (
+                TrimOptions(
+                    noise_db=min(-1.0, noise_db),
+                    min_silence=min_silence,
+                    keep_gap=keep_gap,
+                    trim_edges=self.trim_edges_var.get(),
+                )
+                if self.trim_var.get()
+                else None
+            ),
+            "detect": self._label_key(DETECT_LABELS, self.detect_var, DETECT_MIX),
+            "short_limit": short_limit,
+            "music": music,
         }
 
     def _start(self) -> None:
@@ -454,8 +672,10 @@ class VoiceoverWindow:
             messagebox.showerror("Chưa chạy được", str(exc), parent=self.window)
             return
         # Snapshot so edits during the run can't change what is being voiced.
-        jobs = [(iid, self.items[iid].path, self.items[iid].srt_text) for iid in ids]
-        for iid, _path, _text in jobs:
+        jobs = [
+            (iid, self.items[iid].path, self.items[iid].srt_text, self.items[iid].layout) for iid in ids
+        ]
+        for iid, *_rest in jobs:
             self.items[iid].status = "Đang chờ..."
             self._refresh_row(iid)
         self.cancel_event.clear()
@@ -463,19 +683,19 @@ class VoiceoverWindow:
         self.worker = threading.Thread(target=self._run_queue, args=(jobs, config), daemon=True)
         self.worker.start()
 
-    def _run_queue(self, jobs: list[tuple[str, Path, str]], config: dict[str, Any]) -> None:
+    def _run_queue(self, jobs: list[tuple[str, Path, str, str]], config: dict[str, Any]) -> None:
         failed = 0
         total = len(jobs)
         counter = {"done": 0}
         lock = threading.Lock()
 
-        def run_one(job: tuple[str, Path, str]) -> bool:
-            iid, path, srt_text = job
+        def run_one(job: tuple[str, Path, str, str]) -> bool:
+            iid, path, srt_text, layout = job
             if self.cancel_event.is_set():
                 self.events.put(("row", (iid, "Đã dừng")))
                 return True
             try:
-                output, note = self._process(iid, path, srt_text, config)
+                output, note = self._process(iid, path, srt_text, layout, config)
             except InterruptedError:
                 self.events.put(("row", (iid, "Đã dừng")))
                 return True
@@ -498,7 +718,7 @@ class VoiceoverWindow:
             self.events.put(("error", str(exc)))
 
     def _process(
-        self, iid: str, video: Path, srt_text: str, config: dict[str, Any]
+        self, iid: str, video: Path, srt_text: str, layout: str, config: dict[str, Any]
     ) -> tuple[Path, str]:
         def step(message: str) -> None:
             self.events.put(("row", (iid, message)))
@@ -555,10 +775,72 @@ class VoiceoverWindow:
                 encoding="utf-8",
             )
         step("Đang ghép giọng vào video...")
-        output = mix_voiceover(
-            video, voice_audio, out_dir / f"{stem}{OUTPUT_SUFFIX}.mp4", info, config["options"], self.cancel_event
+        final = out_dir / f"{stem}{OUTPUT_SUFFIX}.mp4"
+        if config["trim"] is None and config["music"] is None and layout == LAYOUT_ORIGINAL:
+            output = mix_voiceover(video, voice_audio, final, info, config["options"], self.cancel_event)
+            return output, note
+        raw = mix_voiceover(
+            video, voice_audio, work_dir / f"{stem}_voiced_raw.mp4", info, config["options"], self.cancel_event
         )
-        return output, note
+        try:
+            output, finish_note = self._finish(iid, raw, voice_audio, final, layout, config)
+        finally:
+            raw.unlink(missing_ok=True)
+        return output, ", ".join(part for part in (note, finish_note) if part)
+
+    def _finish(
+        self, iid: str, raw: Path, voice_audio: Path, final: Path, layout: str, config: dict[str, Any]
+    ) -> tuple[Path, str]:
+        """Shorten pauses, reframe and add background music to the mixed video in one encode."""
+        def step(message: str) -> None:
+            self.events.put(("row", (iid, message)))
+
+        raw_info = probe_media(raw)
+        fps = raw_info.fps or DEFAULT_FPS
+        notes: list[str] = []
+        if config["trim"] is not None:
+            step("Đang tìm khoảng lặng...")
+            if config["detect"] == DETECT_VOICE:
+                source, source_duration = voice_audio, probe_media(voice_audio).duration
+            else:
+                source, source_duration = raw, raw_info.duration
+            # The voice can run past the video end; that part is already cut off in raw.
+            plan = analyze(
+                source,
+                config["trim"],
+                min(source_duration, raw_info.duration),
+                raw_info.duration,
+                fps,
+            )
+            notes.append(
+                f"cắt {len(plan.cuts)} khoảng lặng, {clock(plan.duration)} → {clock(plan.new_duration)}"
+            )
+        else:
+            plan = no_cut_plan(raw_info.duration)
+        final_layout = resolve_layout(layout, plan.new_duration, config["short_limit"])
+        if final_layout != LAYOUT_ORIGINAL:
+            final = final.with_name(final.stem + VERTICAL_SUFFIX + final.suffix)
+            notes.append("dọc 9:16")
+        if config["music"] is not None:
+            notes.append("có nhạc nền")
+        if not plan.cuts and config["music"] is None and final_layout == LAYOUT_ORIGINAL:
+            final.unlink(missing_ok=True)
+            raw.replace(final)
+            return final, ", ".join(notes)
+        step("Đang dựng bản cuối...")
+        render_trimmed(
+            plan,
+            None,
+            final,
+            video=raw,
+            video_duration=raw_info.duration,
+            fps=fps,
+            layout=final_layout,
+            music=config["music"],
+            on_progress=lambda value: step(f"Đang dựng bản cuối {value * 100:.0f}%"),
+            cancel_event=self.cancel_event,
+        )
+        return final, ", ".join(notes)
 
     @staticmethod
     def _reusable_voice(work_dir: Path, stem: str, meta_path: Path, fingerprint: str) -> Path | None:
