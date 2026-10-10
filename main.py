@@ -49,6 +49,11 @@ TOOLS = (
         ROOT / "gemini_srt_voiceover.py",
     ),
     (
+        "Cắt khoảng lặng MP3 + MP4",
+        "Rút ngắn chỗ ngừng dài giữa 2 câu trong MP3 (chừa ~200ms) và cắt MP4 y chang để khớp timeline.",
+        ROOT / "silence_trimmer.py",
+    ),
+    (
         "Tải video (Bilibili, YouTube...)",
         "Tải video/audio bằng yt-dlp. Cần: pip install PySide6 yt-dlp.",
         ROOT / "download_bilibili" / "main.py",

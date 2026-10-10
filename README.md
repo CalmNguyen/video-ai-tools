@@ -9,7 +9,7 @@ python main.py
 ```
 
 Launcher có: Cắt Short từ video dài, Full Video Editor, Tự lên kịch bản + TTS +
-dựng video, Sửa SRT bằng Gemini, Thêm giọng từ SRT vào video, và Tải video. Mỗi tool mở trong một cửa sổ riêng.
+dựng video, Sửa SRT bằng Gemini, Thêm giọng từ SRT vào video, Cắt khoảng lặng MP3 + MP4, và Tải video. Mỗi tool mở trong một cửa sổ riêng.
 
 ## Thêm giọng từ SRT vào video (TTS For Free)
 
@@ -28,6 +28,26 @@ Dành cho video gốc đã có âm thanh nhưng thiếu nhiều chỗ nói. Mở
 Kết quả: `<tên video>_voiced.mp4` (hình giữ nguyên, không encode lại nếu codec cho phép).
 File SRT và audio giọng được lưu ở thư mục `voiceover_work/`. Chạy lại cùng SRT/giọng thì dùng
 lại audio đã tạo, không tốn thêm credit (có thể tắt bằng checkbox).
+
+## Cắt khoảng lặng MP3 + MP4
+
+Dành cho video (thường không có tiếng) dựng theo timeline của một file MP3 giọng đọc, khi
+giữa các câu ngừng quá lâu (nói 1-3s rồi 5s sau mới nói tiếp). Mở từ launcher hoặc chạy
+`python silence_trimmer.py`. Chỉ cần FFmpeg, không cần API key.
+
+1. Chọn MP3 giọng đọc và MP4 (nếu có MP4 cùng tên cạnh MP3 thì tự điền).
+2. Chỉnh nếu cần:
+   - `Giữ lại giữa 2 câu`: khoảng lặng còn lại sau khi cắt (mặc định 200ms, 150ms là gọn hơn).
+   - `Chỉ cắt khi lặng dài hơn`: ngừng ngắn hơn mức này giữ nguyên (mặc định 400ms).
+   - `Ngưỡng im lặng`: mặc định -40dB. Tiếng ồn nền bị coi là nói thì đổi -35/-30,
+     bị lẹm cuối chữ thì đổi -45/-50.
+   - `Cắt cả khoảng lặng đầu/cuối file`: mặc định tắt (giữ nguyên intro/outro của video).
+3. `Phân tích khoảng lặng` để xem danh sách đoạn sẽ cắt và độ dài mới.
+4. `Cắt + xuất`: MP3 và MP4 bị cắt đúng cùng các đoạn (cắt ở ranh giới frame nên không bị
+   lệch tiếng/hình), mỗi chỗ ngừng chừa một nửa khoảng giữ lại sau câu trước và một nửa trước câu sau.
+
+Kết quả: `<tên video>_trimmed.mp4` (hình đã cắt + tiếng MP3 đã cắt) và nếu bật thì thêm
+`<tên mp3>_trimmed.mp3`. Video được encode lại (H.264, CRF 18) vì phải cắt chính xác từng frame.
 
 ## Sửa SRT bằng Gemini
 
