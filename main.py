@@ -50,7 +50,7 @@ TOOLS = (
     ),
     (
         "Cắt khoảng lặng MP3 + MP4",
-        "Rút ngắn chỗ ngừng dài giữa 2 câu trong MP3 (chừa ~200ms) và cắt MP4 y chang để khớp timeline.",
+        "Nhiều cặp MP3+MP4 song song: rút ngắn chỗ ngừng dài giữa 2 câu, cắt MP4 y chang; xuất ngang hoặc dọc 9:16.",
         ROOT / "silence_trimmer.py",
     ),
     (

@@ -21,6 +21,16 @@ DEFAULT_NOISE_DB = -40.0
 DEFAULT_MIN_SILENCE_MS = 400
 DEFAULT_KEEP_GAP_MS = 200
 DEFAULT_FPS = 30.0
+# Output frame: keep the source frame, or a 9:16 Shorts frame.
+LAYOUT_ORIGINAL = "original"
+LAYOUT_VERTICAL_BLUR = "vertical_blur"
+LAYOUT_VERTICAL_CROP = "vertical_crop"
+LAYOUTS = {
+    LAYOUT_ORIGINAL: "Ngang (giữ nguyên khung gốc)",
+    LAYOUT_VERTICAL_BLUR: "Dọc 9:16 - giữ đủ hình, nền mờ",
+    LAYOUT_VERTICAL_CROP: "Dọc 9:16 - phóng to, cắt 2 bên",
+}
+VERTICAL_SIZE = (1080, 1920)
 # MP3 encoder padding makes the file a few frames longer than the last silence_end.
 EDGE_TOLERANCE = 0.25
 
@@ -178,16 +188,17 @@ def build_filter_graph(
     audio_input: int,
     duration: float,
     video_pad: float = 0.0,
+    layout: str = LAYOUT_ORIGINAL,
 ) -> str:
     """trim/atrim every kept piece and concat them back together. Both streams are
-    first padded to `duration` (silence / frozen last frame) so they line up."""
+    first padded to `duration` (silence / frozen last frame) so they line up; the
+    frame layout is applied once after concat so cut frames are never scaled."""
     count = len(keeps)
     lines: list[str] = []
     if video:
-        pad = f"tpad=stop_mode=clone:stop_duration={video_pad:.6f}," if video_pad > 0 else ""
+        pad = f",tpad=stop_mode=clone:stop_duration={video_pad:.6f}" if video_pad > 0 else ""
         lines.append(
-            f"[0:v]fps={fps:.6f},{pad}scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,split={count}"
-            + "".join(f"[vs{i}]" for i in range(count))
+            f"[0:v]fps={fps:.6f}{pad},split={count}" + "".join(f"[vs{i}]" for i in range(count))
         )
     lines.append(
         f"[{audio_input}:a]aresample=48000,apad=whole_dur={duration:.6f},asplit={count}"
@@ -200,9 +211,32 @@ def build_filter_graph(
             pieces.append(f"[v{i}]")
         lines.append(f"[as{i}]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{i}]")
         pieces.append(f"[a{i}]")
-    out = "[vout][aout]" if video else "[aout]"
+    out = "[vcat][aout]" if video else "[aout]"
     lines.append("".join(pieces) + f"concat=n={count}:v={1 if video else 0}:a=1{out}")
+    if video:
+        lines.append(layout_filter(layout, "[vcat]", "[vout]"))
     return ";\n".join(lines)
+
+
+def layout_filter(layout: str, source: str, output: str) -> str:
+    width, height = VERTICAL_SIZE
+    if layout == LAYOUT_VERTICAL_CROP:
+        return (
+            f"{source}scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},setsar=1{output}"
+        )
+    if layout == LAYOUT_VERTICAL_BLUR:
+        # Whole frame fitted in the middle over a blurred, zoomed copy of itself
+        # (blurred at quarter size: same look, much faster).
+        return (
+            f"{source}split=2[bg_src][fg_src];"
+            f"[bg_src]scale={width // 4}:{height // 4}:force_original_aspect_ratio=increase,"
+            f"crop={width // 4}:{height // 4},boxblur=10:2,scale={width}:{height},setsar=1[bg];"
+            f"[fg_src]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2{output}"
+        )
+    return f"{source}scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1{output}"
 
 
 @lru_cache(maxsize=1)
@@ -268,6 +302,7 @@ def render_trimmed(
     video: Path | None = None,
     video_duration: float = 0.0,
     fps: float = DEFAULT_FPS,
+    layout: str = LAYOUT_ORIGINAL,
     crf: int = 18,
     audio_bitrate: str = "192k",
     on_progress: Callable[[float], None] | None = None,
@@ -288,6 +323,7 @@ def render_trimmed(
                 audio_input=1 if video else 0,
                 duration=plan.duration,
                 video_pad=max(0.0, plan.duration - video_duration) if video_duration > 0 else 0.0,
+                layout=layout,
             ),
             encoding="utf-8",
         )

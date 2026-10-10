@@ -32,22 +32,35 @@ lại audio đã tạo, không tốn thêm credit (có thể tắt bằng checkb
 ## Cắt khoảng lặng MP3 + MP4
 
 Dành cho video (thường không có tiếng) dựng theo timeline của một file MP3 giọng đọc, khi
-giữa các câu ngừng quá lâu (nói 1-3s rồi 5s sau mới nói tiếp). Mở từ launcher hoặc chạy
-`python silence_trimmer.py`. Chỉ cần FFmpeg, không cần API key.
+giữa các câu ngừng quá lâu (nói 1-3s rồi 5s sau mới nói tiếp). Xử lý nhiều cặp song song.
+Mở từ launcher hoặc chạy `python silence_trimmer.py`. Chỉ cần FFmpeg, không cần API key.
 
-1. Chọn MP3 giọng đọc và MP4 (nếu có MP4 cùng tên cạnh MP3 thì tự điền).
-2. Chỉnh nếu cần:
+1. `Thêm file MP3 + MP4...` chọn nhiều file một lần (hoặc `Thêm cả thư mục...`). MP3 và MP4
+   cùng tên được tự ghép thành một cặp. Tên khác nhau thì chọn dòng rồi
+   `Đổi MP3 dòng chọn...` / `Đổi MP4 dòng chọn...`. Dòng không có MP4 thì chỉ cắt MP3.
+2. Chỉnh nếu cần (áp dụng cho mọi cặp):
    - `Giữ lại giữa 2 câu`: khoảng lặng còn lại sau khi cắt (mặc định 200ms, 150ms là gọn hơn).
    - `Chỉ cắt khi lặng dài hơn`: ngừng ngắn hơn mức này giữ nguyên (mặc định 400ms).
    - `Ngưỡng im lặng`: mặc định -40dB. Tiếng ồn nền bị coi là nói thì đổi -35/-30,
      bị lẹm cuối chữ thì đổi -45/-50.
    - `Cắt cả khoảng lặng đầu/cuối file`: mặc định tắt (giữ nguyên intro/outro của video).
-3. `Phân tích khoảng lặng` để xem danh sách đoạn sẽ cắt và độ dài mới.
-4. `Cắt + xuất`: MP3 và MP4 bị cắt đúng cùng các đoạn (cắt ở ranh giới frame nên không bị
-   lệch tiếng/hình), mỗi chỗ ngừng chừa một nửa khoảng giữ lại sau câu trước và một nửa trước câu sau.
+   - `Chạy song song`: số cặp xử lý cùng lúc (mặc định 3; máy yếu thì để 1-2).
+3. `Khung xuất` (cột `Khung` của từng dòng; chọn dòng rồi `Áp dụng cho dòng chọn`,
+   không chọn dòng nào = đổi tất cả):
+   - `Tự động` (mặc định): sau khi cắt mà ≤ 60 giây (chỉnh được) thì xuất dọc nền mờ để làm
+     Short, dài hơn thì giữ ngang.
+   - `Ngang`: giữ nguyên khung gốc.
+   - `Dọc 9:16 - giữ đủ hình, nền mờ` (1080x1920): cả khung hình nằm giữa, trên/dưới là
+     bản phóng to làm mờ. Hợp với video quay màn hình vì không mất chữ ở 2 bên.
+   - `Dọc 9:16 - phóng to, cắt 2 bên` (1080x1920): lấp đầy khung, mất phần 2 bên.
+4. `Phân tích khoảng lặng` để xem số chỗ cắt và độ dài mới (chọn một dòng để xem chi tiết),
+   rồi `Cắt + xuất` (không chọn dòng nào = chạy tất cả). MP3 và MP4 bị cắt đúng cùng các
+   đoạn (cắt ở ranh giới frame nên không lệch tiếng/hình), mỗi chỗ ngừng chừa một nửa khoảng
+   giữ lại sau câu trước và một nửa trước câu sau.
 
-Kết quả: `<tên video>_trimmed.mp4` (hình đã cắt + tiếng MP3 đã cắt) và nếu bật thì thêm
-`<tên mp3>_trimmed.mp3`. Video được encode lại (H.264, CRF 18) vì phải cắt chính xác từng frame.
+Kết quả: `<tên video>_trimmed.mp4` (bản dọc: `<tên video>_trimmed_9x16.mp4`) gồm hình đã cắt +
+tiếng MP3 đã cắt, và nếu bật thì thêm `<tên>_trimmed.mp3`. Video được encode lại (H.264, CRF 18)
+vì phải cắt chính xác từng frame.
 
 ## Sửa SRT bằng Gemini
 
